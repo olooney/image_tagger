@@ -340,7 +340,7 @@ def _detect_line_corners(image: np.ndarray) -> np.ndarray | None:
         return None
     horizontal: list[np.ndarray] = []
     vertical: list[np.ndarray] = []
-    for raw_line in lines[:, 0]:
+    for raw_line in lines.reshape(-1, 4):
         x1, y1, x2, y2 = raw_line.astype(float)
         if abs(x2 - x1) >= abs(y2 - y1):
             horizontal.append(raw_line.astype(float))

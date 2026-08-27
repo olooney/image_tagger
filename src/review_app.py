@@ -1,6 +1,7 @@
 import html
 import logging
 import os
+import re
 import shutil
 import socket
 import time
@@ -8,15 +9,22 @@ import webbrowser
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 from urllib.parse import quote
 
 import jinja2
+import cv2
+import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
+from PIL import Image
+from pydantic import BaseModel, Field
+from send2trash import send2trash
 
 import image_tagger as it
+import transform
+from constants import WELCOME_EXTENSIONS
 from stackmap import StackMap
 from util import Pathish, make_unique
 
@@ -29,6 +37,7 @@ page_template = template_environment.get_template("review.html")
 card_template = template_environment.get_template("review_card.html")
 app = FastAPI(title="Image Metadata Review")
 LOGGER: logging.Logger = logging.getLogger(__name__)
+REVIEW_ID_COLUMN: str = it.REVIEW_ID_COLUMN
 GENRE_OPTIONS: list[str] = [
     "sci-fi",
     "fantasy",
@@ -41,6 +50,31 @@ GENRE_OPTIONS: list[str] = [
     "nature",
     "abstract",
 ]
+
+
+class ClipRequest(BaseModel):
+    """Interactive crop and optional resize parameters."""
+
+    points: list[tuple[float, float]] = Field(min_length=4, max_length=4)
+    background: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
+    mode: Literal["perspective", "rectangle"] = "perspective"
+    output_width: int | None = Field(default=None, ge=1)
+    output_height: int | None = Field(default=None, ge=1)
+    resampling: Literal["nearest", "bilinear", "bicubic", "lanczos"] = "lanczos"
+
+
+class ClipCoordinates(BaseModel):
+    """Corners and background returned for interactive clipping."""
+
+    points: list[transform.Corner] = Field(min_length=4, max_length=4)
+    background_color_rgb: transform.RgbColor
+
+
+CLIP_COORDINATES_PROMPT: str = """Identify the four corners of the main flat rectangular subject in this image.
+Return its source-image pixel coordinates in top-left, top-right, bottom-right, bottom-left order.
+Corners may be outside the image when perspective correction requires extrapolation.
+Also infer the RGB color immediately outside the subject for filling extrapolated pixels.
+Return exactly four points and one background RGB color; make no other decisions."""
 
 
 def set_review_metadata(metadata_filename: Pathish, stackmap: StackMap) -> None:
@@ -110,6 +144,211 @@ def current_image_path(row: pd.Series[Any]) -> Path | None:
     return None
 
 
+def review_directory_images(directory: Path) -> list[Path]:
+    """Return all reviewable images below a directory."""
+    return sorted(
+        it.find_images(
+            directory,
+            extension_filter=WELCOME_EXTENSIONS,
+        )
+    )
+
+
+def ensure_review_metadata(metadata_path: Path, image_paths: list[Path]) -> None:
+    """Ensure every reviewable image has an editable metadata row."""
+    it.ensure_metadata_review_ids(metadata_path)
+    if metadata_path.is_file():
+        try:
+            metadata_df = pd.read_csv(metadata_path, keep_default_na=False)
+        except pd.errors.EmptyDataError:
+            metadata_df = pd.DataFrame(columns=it.csv_columns)
+    else:
+        metadata_df = pd.DataFrame(columns=it.csv_columns)
+
+    for column in it.csv_columns:
+        if column not in metadata_df:
+            metadata_df[column] = ""
+
+    images_by_name: dict[str, list[Path]] = {}
+    for image_path in image_paths:
+        images_by_name.setdefault(image_path.name.casefold(), []).append(image_path)
+
+    represented_paths: set[Path] = set()
+    for index, raw_row in metadata_df.iterrows():
+        row = cast("pd.Series[Any]", raw_row)
+        if row.get("status") != "ok":
+            continue
+        image_path = current_image_path(row)
+        if image_path is None:
+            candidate_names = [
+                str(row.get(column, "")).strip()
+                for column in ("clean_filename", "original_filename")
+            ]
+            candidates = {
+                candidate.resolve()
+                for filename in candidate_names
+                for candidate in images_by_name.get(Path(filename).name.casefold(), [])
+                if filename
+            }
+            if len(candidates) == 1:
+                image_path = candidates.pop()
+                metadata_df.at[index, "original_filepath"] = str(image_path)
+        if image_path is not None:
+            represented_paths.add(image_path.resolve())
+
+    new_rows: list[dict[str, Any]] = []
+    for image_path in image_paths:
+        if image_path.resolve() in represented_paths:
+            continue
+        row = dict.fromkeys(it.csv_columns, "")
+        row.update(
+            {
+                REVIEW_ID_COLUMN: it.new_metadata_review_id(),
+                "status": "ok",
+                "original_filepath": str(image_path.resolve()),
+                "original_filename": image_path.name,
+            }
+        )
+        new_rows.append(row)
+
+    if new_rows:
+        metadata_df = pd.concat(
+            [metadata_df, pd.DataFrame(new_rows)],
+            ignore_index=True,
+        )
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_df.to_csv(metadata_path, index=False)
+
+
+def metadata_row_index(metadata_df: pd.DataFrame, row_id: str) -> int:
+    """Resolve a stable review ID, with positional fallback for legacy metadata."""
+    if REVIEW_ID_COLUMN in metadata_df:
+        matches = metadata_df.index[metadata_df[REVIEW_ID_COLUMN].astype(str) == row_id]
+        if len(matches) == 1:
+            return int(matches[0])
+        raise ValueError(f"Unknown row id: {row_id}")
+    try:
+        row_index = int(row_id) - 1
+    except ValueError as error:
+        raise ValueError(f"Unknown row id: {row_id}") from error
+    if row_index < 0 or row_index >= len(metadata_df):
+        raise ValueError(f"Unknown row id: {row_id}")
+    return row_index
+
+
+def review_row_image_path(metadata_path: Path, row_id: str) -> Path:
+    """Return the current image path for one stable review row."""
+    if not metadata_path.is_file():
+        raise ValueError(f"Metadata file not found: {metadata_path}")
+    metadata_df = pd.read_csv(metadata_path, keep_default_na=False)
+    row_index = metadata_row_index(metadata_df, row_id)
+    image_path = current_image_path(cast("pd.Series[Any]", metadata_df.iloc[row_index]))
+    if image_path is None:
+        raise ValueError(f"Image not found for row id: {row_id}")
+    return image_path
+
+
+def detect_clip_corners(
+    image_path: Path,
+    algorithm: Literal["hough", "contour", "llm"] = "hough",
+) -> tuple[tuple[int, int], list[list[float]], str | None]:
+    """Return image dimensions and detected perspective corners."""
+    with Image.open(image_path) as opened_image:
+        source = opened_image.convert("RGB")
+    source_array = np.asarray(source)
+    edge_pixels = np.concatenate(
+        [
+            source_array[0, :, :],
+            source_array[-1, :, :],
+            source_array[:, 0, :],
+            source_array[:, -1, :],
+        ],
+    )
+    edge_color = np.median(edge_pixels, axis=0).astype(np.uint8)
+    background: str | None = "#{:02x}{:02x}{:02x}".format(*edge_color)
+    if algorithm == "llm":
+        client = it.get_vision_model_client_adapter(it.VisionModelProvider.OPENAI)
+        result = client.vision_task(
+            it.base64_encode_image(source),
+            CLIP_COORDINATES_PROMPT,
+            ClipCoordinates,
+        )
+        coordinates = ClipCoordinates.model_validate(result.data.model_dump())
+        corners = np.asarray(coordinates.points, dtype=np.float32)
+        corners = transform._validate_corners(corners, source.size)
+        if corners is None:
+            raise ValueError("The LLM returned invalid crop coordinates for this image.")
+        background = "#{:02x}{:02x}{:02x}".format(
+            *(max(0, min(255, value)) for value in coordinates.background_color_rgb)
+        )
+    else:
+        image = cv2.cvtColor(source_array, cv2.COLOR_RGB2BGR)
+        corners = (
+            transform._detect_line_corners(image)
+            if algorithm == "hough"
+            else transform._detect_contour_corners(image, None)
+        )
+    if corners is None:
+        width, height = source.size
+        corners = np.asarray(
+            [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]],
+            dtype=np.float32,
+        )
+    return source.size, corners.tolist(), background
+
+
+def apply_clip(image_path: Path, request: ClipRequest) -> None:
+    """Replace an image with an interactively selected perspective crop."""
+    with Image.open(image_path) as opened_image:
+        source = opened_image.convert("RGB")
+    corners = np.asarray(request.points, dtype=np.float32)
+    if not np.isfinite(corners).all():
+        raise ValueError("The selected crop points do not form a valid quadrilateral.")
+    corners = transform._order_corners(corners)
+    if abs(cv2.contourArea(corners.reshape((-1, 1, 2)))) < 4:
+        raise ValueError("The selected crop points do not form a valid quadrilateral.")
+    if request.mode == "rectangle":
+        left = max(0, int(np.floor(np.min(corners[:, 0]))))
+        top = max(0, int(np.floor(np.min(corners[:, 1]))))
+        right = min(source.width, int(np.ceil(np.max(corners[:, 0]))) + 1)
+        bottom = min(source.height, int(np.ceil(np.max(corners[:, 1]))) + 1)
+        if right - left < 2 or bottom - top < 2:
+            raise ValueError("The selected rectangle is too small to crop.")
+        clipped = source.crop((left, top, right, bottom))
+        if request.output_width is not None and request.output_height is not None:
+            resampling = {
+                "nearest": Image.Resampling.NEAREST,
+                "bilinear": Image.Resampling.BILINEAR,
+                "bicubic": Image.Resampling.BICUBIC,
+                "lanczos": Image.Resampling.LANCZOS,
+            }[request.resampling]
+            clipped = clipped.resize(
+                (request.output_width, request.output_height),
+                resample=resampling,
+            )
+    else:
+        color = [int(request.background[index : index + 2], 16) for index in (1, 3, 5)]
+        background = transform.BackgroundHint(
+            color_rgb=color,
+            confidence=1,
+            uniformity="uniform",
+        )
+        clipped = transform._perspective_crop(source, corners, background=background)
+        if clipped is None:
+            raise ValueError("The selected crop could not be rendered.")
+
+    temporary_path = image_path.with_name(
+        f".{image_path.stem}.clip-{time.time_ns()}{image_path.suffix}"
+    )
+    try:
+        clipped.save(temporary_path)
+        send2trash(image_path)
+        temporary_path.replace(image_path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
 def review_items(metadata_path: Path) -> list[dict[str, Any]]:
     """Return editable review rows from a metadata CSV."""
     if not metadata_path.is_file():
@@ -126,11 +365,19 @@ def review_items(metadata_path: Path) -> list[dict[str, Any]]:
             continue
 
         relative_path = os.path.relpath(image_path, metadata_path.parent)
-        item["row_id"] = index
-        item["image_src"] = f"/images/{quote(Path(relative_path).as_posix())}"
+        item["row_id"] = str(item.get(REVIEW_ID_COLUMN, "")).strip() or str(index)
+        item["image_src"] = (
+            f"/images/{quote(Path(relative_path).as_posix())}?v={time.time_ns()}"
+        )
         item["current_filename"] = image_path.name
-        item["clean_filename"] = str(item.get("clean_filename", "")) or image_path.name
-        item["tags_text"] = str(item.get("tags", ""))
+        item["clean_filename"] = str(item.get("clean_filename", ""))
+        with Image.open(image_path) as source_image:
+            item["display_width"], item["display_height"] = source_image.size
+        item["tags_text"] = "\n".join(
+            tag.strip()
+            for tag in re.split(r"[;\r\n]+", str(item.get("tags", "")))
+            if tag.strip()
+        )
         notes = item.get("notes", "")
         item["notes"] = notes if notes and isinstance(notes, str) else ""
         items.append(item)
@@ -166,16 +413,15 @@ def rename_review_image(
     return target.name
 
 
-def write_metadata_row(metadata_path: Path, row_id: int, updates: dict[str, str]) -> None:
-    """Write editable field updates for one one-based CSV row."""
+def write_metadata_row(metadata_path: Path, row_id: str, updates: dict[str, str]) -> None:
+    """Write editable field updates for one stable review row."""
+    it.ensure_metadata_review_ids(metadata_path)
     if not metadata_path.is_file():
         raise ValueError(f"Metadata file not found: {metadata_path}")
 
     editable_columns = {"category", "genre", "clean_filename", "tags", "description"}
     metadata_df = pd.read_csv(metadata_path, keep_default_na=False)
-    row_index = row_id - 1
-    if row_index < 0 or row_index >= len(metadata_df):
-        raise ValueError(f"Unknown row id: {row_id}")
+    row_index = metadata_row_index(metadata_df, row_id)
 
     if "clean_filename" in updates:
         updates["clean_filename"] = rename_review_image(
@@ -186,6 +432,12 @@ def write_metadata_row(metadata_path: Path, row_id: int, updates: dict[str, str]
 
     for column, value in updates.items():
         if column in editable_columns and column in metadata_df:
+            if column == "tags":
+                value = ";".join(
+                    tag.strip()
+                    for tag in re.split(r"[;\r\n]+", value)
+                    if tag.strip()
+                )
             metadata_df.at[row_index, column] = value.strip()
 
     backup_path = metadata_path.with_suffix(f"{metadata_path.suffix}.bak")
@@ -200,15 +452,14 @@ def write_metadata_row(metadata_path: Path, row_id: int, updates: dict[str, str]
             time.sleep(0.25)
 
 
-def delete_metadata_row_image(metadata_path: Path, row_id: int) -> None:
-    """Delete the current image for one one-based CSV row and hide it from review."""
+def delete_metadata_row_image(metadata_path: Path, row_id: str) -> None:
+    """Delete the current image for one stable review row and hide it from review."""
+    it.ensure_metadata_review_ids(metadata_path)
     if not metadata_path.is_file():
         raise ValueError(f"Metadata file not found: {metadata_path}")
 
     metadata_df = pd.read_csv(metadata_path, keep_default_na=False)
-    row_index = row_id - 1
-    if row_index < 0 or row_index >= len(metadata_df):
-        raise ValueError(f"Unknown row id: {row_id}")
+    row_index = metadata_row_index(metadata_df, row_id)
 
     row = cast("pd.Series[Any]", metadata_df.iloc[row_index])
     image_path = current_image_path(row)
@@ -284,7 +535,13 @@ async def image_file(image_path: str) -> FileResponse:
         raise HTTPException(status_code=404) from error
     if not resolved_path.is_file():
         raise HTTPException(status_code=404)
-    return FileResponse(resolved_path)
+    return FileResponse(
+        resolved_path,
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+        },
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -304,7 +561,7 @@ async def home() -> str:
 
 
 @app.post("/row/{row_id}", response_class=HTMLResponse)
-async def update_row(row_id: int, request: Request) -> str:
+async def update_row(row_id: str, request: Request) -> str:
     """Update one one-based metadata row and return the refreshed card."""
     metadata_path = review_metadata_path()
     try:
@@ -333,10 +590,59 @@ async def update_row(row_id: int, request: Request) -> str:
 
 
 @app.delete("/row/{row_id}", response_class=HTMLResponse)
-async def delete_row(row_id: int) -> str:
-    """Delete one reviewed image and remove its card."""
-    delete_metadata_row_image(review_metadata_path(), row_id)
-    return ""
+async def delete_row(row_id: str) -> str:
+    """Delete one reviewed image and return its final operation message."""
+    metadata_path = review_metadata_path()
+    image_path = review_row_image_path(metadata_path, row_id)
+    delete_metadata_row_image(metadata_path, row_id)
+    return (
+        '<div class="alert alert-secondary delete-item-result" role="status">'
+        f"Deleted {html.escape(image_path.name)}."
+        "</div>"
+    )
+
+
+@app.get("/row/{row_id}/clip")
+async def clip_details(
+    row_id: str,
+    algorithm: Literal["hough", "contour", "llm"] = "hough",
+) -> dict[str, Any]:
+    """Return source geometry and detected clip points without altering the image."""
+    try:
+        image_path = review_row_image_path(review_metadata_path(), row_id)
+        (width, height), points, background = detect_clip_corners(image_path, algorithm)
+        return {
+            "width": width,
+            "height": height,
+            "points": points,
+            "background": background,
+        }
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    except Exception as error:
+        LOGGER.exception("Failed to detect %s crop for row %s.", algorithm, row_id)
+        raise HTTPException(
+            status_code=502,
+            detail=f"{algorithm.upper()} detection failed: {error}",
+        ) from error
+
+
+@app.post("/row/{row_id}/clip")
+async def clip_row(row_id: str, request: ClipRequest) -> dict[str, str | int]:
+    """Apply an interactive perspective correction to one image."""
+    try:
+        image_path = review_row_image_path(review_metadata_path(), row_id)
+        apply_clip(image_path, request)
+        relative_path = os.path.relpath(image_path, review_metadata_path().parent)
+        with Image.open(image_path) as clipped_image:
+            width, height = clipped_image.size
+        return {
+            "image_src": f"/images/{quote(Path(relative_path).as_posix())}",
+            "width": width,
+            "height": height,
+        }
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
 
 @app.post("/shelve", response_class=HTMLResponse)
@@ -350,6 +656,26 @@ async def shelve() -> str:
     return render_shelve_response(metadata_path, output)
 
 
+@app.post("/row/{row_id}/shelve", response_class=HTMLResponse)
+async def shelve_row(row_id: str) -> str:
+    """Shelve one reviewed image and return its final operation message."""
+    metadata_path = review_metadata_path()
+    stdout = StringIO()
+    with redirect_stdout(stdout):
+        it.shelve_images(
+            metadata_path,
+            stackmap=review_stackmap(),
+            verbose=2,
+            review_ids={row_id},
+        )
+    output = stdout.getvalue().strip() or "No image moved."
+    return (
+        '<div class="alert alert-success shelve-item-result" role="status">'
+        f"{html.escape(output)}"
+        "</div>"
+    )
+
+
 def review_metadata(
     metadata_filename: Pathish,
     *,
@@ -360,6 +686,12 @@ def review_metadata(
     import uvicorn
 
     metadata_path = Path(metadata_filename)
+    it.ensure_metadata_review_ids(metadata_path)
+    image_paths = review_directory_images(metadata_path.parent)
+    if not image_paths:
+        print(f"No images found in {metadata_path.parent}.")
+        return
+    ensure_review_metadata(metadata_path, image_paths)
     backup_path = metadata_path.with_suffix(f"{metadata_path.suffix}.bak")
     set_review_metadata(metadata_path, stackmap)
     port = first_available_port(start_port)

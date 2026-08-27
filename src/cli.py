@@ -248,13 +248,12 @@ def report_uploads(args: argparse.Namespace) -> None:
 
 def review_uploads(args: argparse.Namespace) -> None:
     """Serve an editable metadata review app."""
-    if not args.metadata_filename.is_file():
-        raise SystemExit(f"metadata file not found: {args.metadata_filename}")
     review_app.review_metadata(args.metadata_filename, stackmap=args.stackmap_config)
 
 
 def clean_uploads(args: argparse.Namespace) -> None:
     """Remove generated workflow files."""
+    it.ensure_metadata_review_ids(args.metadata_filename)
     for filename in [
         args.metadata_filename,
         args.metadata_filename.with_suffix(f"{args.metadata_filename.suffix}.bak"),
@@ -357,7 +356,7 @@ def build_parser() -> argparse.ArgumentParser:
     dedupe_parser.set_defaults(func=dedupe_uploads)
 
     transform_parser = subparsers.add_parser(
-        "transform",
+        "clip",
         help="Perspective-correct rectangular images with a vision model and OpenCV.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -508,6 +507,8 @@ def main() -> None:
         )
     if args.metadata_filename is None:
         args.metadata_filename = args.directory / METADATA_FILENAME.name
+    if args.command in {"convert", "tag", "prune", "rename", "shelve", "review", "clean"}:
+        it.ensure_metadata_review_ids(args.metadata_filename)
     if args.command == "clean" and args.output_filename is None:
         args.output_filename = args.directory / GALLERY_NAME.name
     args.verbose += args.verbose_delta - args.quiet_delta

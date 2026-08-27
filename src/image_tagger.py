@@ -9,6 +9,7 @@ import re
 import string
 import time
 import traceback
+import uuid
 from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Iterable, Iterator
@@ -205,11 +206,44 @@ csv_columns: list[str] = [
     "filename_already_makes_sense",
     "tags",
     "description",
+    "_review_id",
 ]
+REVIEW_ID_COLUMN: str = "_review_id"
 DEDUPE_REVIEW_FILENAME: Path = Path("dedupe_review.html")
 DEDUPE_EMBEDDINGS_FILENAME: Path = Path("vectors.npz")
 EMBEDDING_CACHE_VERSION: int = 3
 DEFAULT_LARGE_IMAGE_THRESHOLD: int = 1_000_000
+
+
+def new_metadata_review_id() -> str:
+    """Return a time-ordered stable metadata row ID."""
+    return str(uuid.uuid7())
+
+
+def ensure_metadata_review_ids(metadata_filename: Pathish) -> bool:
+    """Persist unique UUID7 IDs for metadata rows when migration is needed."""
+    metadata_path = Path(metadata_filename)
+    if not metadata_path.is_file():
+        return False
+    try:
+        metadata_df = pd.read_csv(metadata_path, keep_default_na=False)
+    except pd.errors.EmptyDataError:
+        metadata_df = pd.DataFrame(columns=csv_columns)
+
+    changed = REVIEW_ID_COLUMN not in metadata_df
+    if changed:
+        metadata_df[REVIEW_ID_COLUMN] = ""
+    used_ids: set[str] = set()
+    for index, value in metadata_df[REVIEW_ID_COLUMN].items():
+        review_id = str(value).strip()
+        if not review_id or review_id in used_ids:
+            review_id = new_metadata_review_id()
+            metadata_df.at[index, REVIEW_ID_COLUMN] = review_id
+            changed = True
+        used_ids.add(review_id)
+    if changed:
+        metadata_df.to_csv(metadata_path, index=False)
+    return changed
 
 
 class VisionModelProvider(Enum):
@@ -221,7 +255,7 @@ class VisionModelProvider(Enum):
 
 
 GEMMA_MODEL: str = "gemma4:12b"
-OPENAI_MODEL: str = "gpt-5.5"
+OPENAI_MODEL: str = "gpt-5.6-sol"
 QWEN_MODEL: str = "qwen3.5:4b"
 
 
@@ -421,6 +455,7 @@ def update_metadata_filepaths(
 ) -> None:
     """Update metadata rows after image filenames change."""
     metadata_path = Path(metadata_filename)
+    ensure_metadata_review_ids(metadata_path)
     if not metadata_path.is_file():
         return
 
@@ -1176,6 +1211,7 @@ def tag_images(
 ) -> None:
     """Tag images and write metadata rows."""
     output_path = Path(output_filename)
+    ensure_metadata_review_ids(output_path)
     client_adapter = get_vision_model_client_adapter(provider)
     if instructions_filename is None:
         prompt_template = IMAGE_PROMPT_TEMPLATE
@@ -1211,7 +1247,11 @@ def tag_images(
                     vision_durations.append(duration)
                     row["tags"] = ";".join(tag.lower().strip() for tag in row["tags"])
                     row.update(
-                        {"timestamp": datetime.now().isoformat(), "status": "ok"}
+                        {
+                            "timestamp": datetime.now().isoformat(),
+                            "status": "ok",
+                            REVIEW_ID_COLUMN: new_metadata_review_id(),
+                        }
                     )
                     writer.writerow(row)
                     csv_file.flush()
@@ -1259,6 +1299,7 @@ def tag_images(
                             "original_filepath": filepath,
                             "status": "error",
                             "description": error_message,
+                            REVIEW_ID_COLUMN: new_metadata_review_id(),
                         }
                     )
     finally:
@@ -1985,6 +2026,7 @@ def prune_metadata_rows(
 ) -> int:
     """Remove metadata rows whose image files are no longer present."""
     csv_path = Path(csv_filename)
+    ensure_metadata_review_ids(csv_path)
     if not csv_path.is_file():
         if verbose >= 1:
             print(f"no metadata file: {csv_path.name}")
@@ -2037,6 +2079,7 @@ def rename_images(
 ) -> None:
     """Rename images from metadata suggestions."""
     csv_path = Path(csv_filename)
+    ensure_metadata_review_ids(csv_path)
     metadata_df = pd.read_csv(csv_path)
     metadata_updated = False
     display_directory = csv_path.parent
@@ -2125,6 +2168,7 @@ def append_shelved_metadata(
 ) -> None:
     """Append shelved image metadata to the target directory metadata file."""
     target_metadata_path = target.parent / source_metadata_path.name
+    ensure_metadata_review_ids(target_metadata_path)
     if not target_metadata_path.is_file():
         return
 
@@ -2144,6 +2188,9 @@ def append_shelved_metadata(
     target_row["original_filepath"] = os.fspath(target)
     target_row["original_filename"] = target.name
     target_row["clean_filename"] = target.name
+    target_row = target_row.reindex(target_metadata_df.columns)
+    if REVIEW_ID_COLUMN in target_row:
+        target_row[REVIEW_ID_COLUMN] = new_metadata_review_id()
     target_row.to_frame().T.to_csv(
         target_metadata_path,
         mode="a",
@@ -2166,9 +2213,11 @@ def shelve_images(
     stackmap: StackMap,
     verbose: int = 1,
     dry_run: bool = False,
+    review_ids: set[str] | None = None,
 ) -> None:
     """Move images into category folders, while keeping the current shelf scoped."""
     csv_path = Path(csv_filename)
+    ensure_metadata_review_ids(csv_path)
     if not csv_path.is_file():
         return
 
@@ -2178,6 +2227,9 @@ def shelve_images(
     if verbose == 1:
         print(f"working in {quote_display_path(display_directory)}")
     for index, row in metadata_df.iterrows():
+        review_id = str(row.get(REVIEW_ID_COLUMN, cast("int", index) + 1))
+        if review_ids is not None and review_id not in review_ids:
+            continue
         original_source = Path(row["original_filepath"])
 
         if row["status"] != "ok" or not row["category"]:
