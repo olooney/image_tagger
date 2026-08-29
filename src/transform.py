@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from importlib import resources
 from io import BytesIO
 from pathlib import Path
-from typing import Annotated, Literal, cast
+from typing import Annotated, Literal
 
 import cv2
 import jinja2
@@ -20,21 +20,12 @@ from util import quote_display_path
 
 
 TRANSFORM_REVIEW_FILENAME: Path = Path("transform_review.html")
-DEFAULT_MAX_ATTEMPTS: int = 2
 Corner = Annotated[list[float], Field(min_length=2, max_length=2)]
 RgbColor = Annotated[list[int], Field(min_length=3, max_length=3)]
-
-
-TransformStrategy = Literal[
-    "contour_quadrilateral",
-    "line_intersection",
-    "no_transform_needed",
-]
-ReviewDecision = Literal[
-    "good_enough",
-    "adjust_corners",
-    "no_transform_needed",
-    "abandon",
+RelativeCoordinate = Annotated[float, Field(allow_inf_nan=False)]
+NormalizedCorner = Annotated[
+    list[RelativeCoordinate],
+    Field(min_length=2, max_length=2),
 ]
 
 
@@ -46,147 +37,68 @@ class BackgroundHint(BaseModel):
     uniformity: Literal["uniform", "mostly_uniform", "varied"]
 
 
-class TransformParameters(BaseModel):
-    """Fixed detector hints that can be expanded without open-ended JSON."""
+class CropVlmDecision(BaseModel):
+    """Structured VLM choice, reasoning, and normalized crop corners."""
 
-    edge_strength: Literal["low", "medium", "high"] | None
-    expected_boundary_completeness: float | None = Field(ge=0, le=1)
-    notes: str | None
-
-
-class TransformAssessment(BaseModel):
-    """Initial structured routing response from the vision model."""
-
-    strategy: TransformStrategy
-    confidence: float = Field(ge=0, le=1)
-    reason: str
-    approximate_corners: list[Corner] | None = Field(
-        min_length=4,
-        max_length=4,
-    )
-    background: BackgroundHint | None
-    parameters: TransformParameters
+    which: Literal["contour", "hough", "neither"]
+    adjustments: str
+    points: list[NormalizedCorner] = Field(min_length=4, max_length=4)
 
 
-class TransformReview(BaseModel):
-    """Structured review response for a proposed perspective crop."""
+@dataclass(frozen=True)
+class CropDetection:
+    """CV candidates and the VLM-refined crop for one source image."""
 
-    decision: ReviewDecision
-    confidence: float = Field(ge=0, le=1)
-    reason: str
-    replacement_corners: list[Corner] | None = Field(
-        min_length=4,
-        max_length=4,
-    )
+    size: tuple[int, int]
+    background: BackgroundHint
+    contour_corners: np.ndarray
+    hough_corners: np.ndarray
+    final_corners: np.ndarray
+    which: Literal["contour", "hough", "neither"]
+    adjustments: str
 
 
 @dataclass(frozen=True)
 class TransformReviewEntry:
-    """One source image and the result shown in the static review page."""
+    """Four debug views and the crop result for one source image."""
 
     source_path: Path
-    source_image_src: str | None
-    overlay_image_src: str | None
+    hough_image_src: str
+    contour_image_src: str
+    vlm_image_src: str
     transformed_image_src: str | None
     status: str
-    reason: str
-    attempts: int
-    strategy: TransformStrategy
-    parameters_json: str
-    background_json: str
-    review_decision: ReviewDecision | None
+    which: Literal["contour", "hough", "neither"]
+    adjustments: str
 
 
-class VisionConversation:
-    """Keep structured image-transform turns together as one model transcript."""
+CROP_VLM_PROMPT: str = """Choose and refine the crop for the front cover of the book shown.
+You receive three images in this exact order:
+Image 1: original.
+Image 2: contour guess overlay.
+Image 3: Hough guess overlay.
 
-    def __init__(self, client: it.VisionModelClientAdapter, verbose: int) -> None:
-        """Create an empty transcript for one image."""
-        self.client = client
-        self.verbose = verbose
-        self.turns: list[dict[str, object]] = []
+The contour and Hough guesses are also provided as JSON below. Coordinates are normalized x/y
+values where 0 to 1 is the range of the source image, ordered top-left, top-right, bottom-right,
+bottom-left. Coordinates may go somewhat outside that range when a true corner is beyond the
+image frame. For example, (-0.2, 0.3) is perfectly valid and must not be clamped to the image.
+{guesses_json}
 
-    def ask(
-        self,
-        images: list[Image.Image],
-        prompt: str,
-        response_format: type[BaseModel],
-        label: str,
-    ) -> BaseModel:
-        """Send a structured turn with its preceding transcript as context."""
-        history = ""
-        if self.turns:
-            history = "\n\nPrevious structured turns in this same image session:\n" + json.dumps(
-                self.turns,
-                indent=2,
-            )
-        full_prompt = f"{prompt}{history}"
-        encoded_images = [it.base64_encode_image(image) for image in images]
-        if self.verbose >= 3:
-            print(f"{label} request JSON:")
-            print(json.dumps({"prompt": full_prompt}, indent=2))
-        result = self.client.vision_task(encoded_images, full_prompt, response_format)
-        data = response_format.model_validate(result.data.model_dump())
-        response_json = data.model_dump(mode="json")
-        if self.verbose >= 3:
-            print(f"{label} response JSON:")
-            print(json.dumps(response_json, indent=2))
-        self.turns.append({"label": label, "prompt": prompt, "response": response_json})
-        return data
-
-
-ASSESSMENT_PROMPT: str = """You are selecting a perspective-correction strategy for a flat rectangular subject.
-
-First decide whether perspective correction is appropriate. Only choose a transform strategy
-when one single, dominant, planar rectangular subject is the intended output and it occupies
-most of the image. It must need a material improvement from cropping, rotation, or perspective
-correction. Choose `no_transform_needed` for a subject that is already nearly front-facing,
-closely cropped, and needs only minor cleanup. Also choose `no_transform_needed` when the
-image is a broader scene that happens to include a rectangle, such as a box beside a toy, or
-when cropping to a rectangle would discard another main subject.
-
-For books, trace only the front cover. Do not include the spine, page block, hand, or nearby
-objects in the quadrilateral. Choose `contour_quadrilateral` when the full front-cover boundary
-is visible and distinct enough to form a large closed contour. Choose `line_intersection` when
-the intended rectangle remains clear but an edge is broken, weak, damaged, obscured, or cut off
-by the image frame. In that case, extrapolate the visible supporting edge lines. If their true
-intersection lies outside the source image, provide that out-of-bounds corner coordinate; never
-substitute an arbitrary in-bounds point or snap it to the image boundary.
-
-Provide four approximate pixel corners in top-left, top-right, bottom-right, bottom-left order
-for every transform. Corners may be outside the source frame. If any corner is outside the
-frame, provide a background RGB color that represents the surrounding canvas so exposed warped
-areas can be filled naturally. Use null for unavailable nonessential hints. Return only the
-requested structured response."""
-
-REVIEW_PROMPT: str = """Review a proposed perspective correction. The supplied images are,
-in order: the original, the original annotated with a bright green edge-only quadrilateral,
-and the perspective-corrected crop.
-
-Choose `good_enough` when the green boundary follows the intended dominant rectangular subject
-and the crop materially improves its front-facing presentation. Choose `adjust_corners` when
-revised source-image pixel corners would materially improve it; give four replacements in
-top-left, top-right, bottom-right, bottom-left order. When a true corner is cut off, extrapolate
-the side lines and give the out-of-bounds coordinate rather than snapping to the frame. For a
-book, the quadrilateral must follow only the front cover, not the spine or page block. Use null
-for replacement_corners otherwise. Choose `no_transform_needed` if the original was already
-orthorectified and closely cropped, or if the crop merely isolates a rectangle inside a broader
-scene. Choose `abandon` if a credible correction cannot be produced. Return only the requested
-structured response."""
+First choose which guess, if either, best fits the front cover. Then explain what adjustments
+you would make. Finally return exactly four refined points in the same order and coordinate
+system. If unsure, or if the image already appears correctly cropped, use the full-image
+coordinates [[0, 0], [1, 0], [1, 1], [0, 1]]."""
 
 
 def transform_images(
     directory: Path,
     *,
     provider: it.VisionModelProvider = it.VisionModelProvider.OPENAI,
-    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     verbose: int = 1,
     dry_run: bool = False,
     client_adapter: it.VisionModelClientAdapter | None = None,
 ) -> list[TransformReviewEntry]:
-    """Create reviewed perspective-corrected sibling images for a directory."""
-    if max_attempts < 1:
-        raise ValueError("max_attempts must be at least 1.")
+    """Detect and apply one VLM-refined perspective crop per image."""
     directory = Path(directory)
     image_paths = [
         path
@@ -204,7 +116,6 @@ def transform_images(
                 _transform_one_image(
                     source_path,
                     client=client,
-                    max_attempts=max_attempts,
                     verbose=verbose,
                     dry_run=dry_run,
                 )
@@ -223,105 +134,155 @@ def _transform_one_image(
     source_path: Path,
     *,
     client: it.VisionModelClientAdapter,
-    max_attempts: int,
     verbose: int,
     dry_run: bool,
 ) -> TransformReviewEntry:
-    """Assess, crop, and review one image until accepted or rejected."""
+    """Detect, report, and optionally apply one perspective crop."""
     with Image.open(source_path) as source_file:
         source = source_file.convert("RGB")
-    conversation = VisionConversation(client, verbose)
-    assessment = cast(
-        TransformAssessment,
-        conversation.ask([source], ASSESSMENT_PROMPT, TransformAssessment, "assessment"),
+    detection = detect_crop(source, client=client, verbose=verbose)
+    hough_overlay = _draw_quadrilateral(source, detection.hough_corners)
+    contour_overlay = _draw_quadrilateral(source, detection.contour_corners)
+    vlm_overlay = _draw_quadrilateral(source, detection.final_corners)
+    is_full = np.allclose(detection.final_corners, _full_corners(source.size), atol=1)
+    crop = source.copy() if is_full else _perspective_crop(
+        source,
+        detection.final_corners,
+        background=detection.background,
+    )
+    if crop is None:
+        status = "Invalid crop"
+    elif is_full:
+        status = "No transform needed"
+    else:
+        status = "Would transform" if dry_run else "Transformed"
+        if verbose >= 1:
+            print(f"transforming {quote_display_path(source_path)} ...", end="")
+        try:
+            if not dry_run:
+                crop.save(source_path)
+            if verbose >= 1:
+                print("success!")
+        except OSError:
+            if verbose >= 1:
+                print("error!")
+            status = "Write failed"
+    return TransformReviewEntry(
+        source_path=source_path,
+        hough_image_src=_data_url(hough_overlay),
+        contour_image_src=_data_url(contour_overlay),
+        vlm_image_src=_data_url(vlm_overlay),
+        transformed_image_src=_data_url(crop),
+        status=status,
+        which=detection.which,
+        adjustments=detection.adjustments,
     )
 
-    def entry(
-        overlay: Image.Image | None,
-        crop: Image.Image | None,
-        status: str,
-        reason: str,
-        attempts: int,
-        review: TransformReview | None = None,
-    ) -> TransformReviewEntry:
-        """Create one report entry using the image's assessment context."""
-        return _entry(
-            source_path,
-            source,
-            overlay,
-            crop,
-            status,
-            reason,
-            attempts,
-            assessment=assessment,
-            review=review,
-        )
 
-    if assessment.strategy == "no_transform_needed":
-        return entry(None, None, "No transform needed", assessment.reason, 0)
-
-    corners_hint = assessment.approximate_corners
-    last_overlay: Image.Image | None = None
-    for attempt in range(1, max_attempts + 1):
-        corners = _corners_for_attempt(source, assessment, corners_hint)
-        if corners is None:
-            return entry(None, None, "Abandoned", "Could not detect four plausible corners.", attempt)
-        overlay = _draw_quadrilateral(source, corners)
-        crop = _perspective_crop(source, corners, background=assessment.background)
-        if crop is None:
-            return entry(overlay, None, "Abandoned", "Detected corners did not form a valid quadrilateral.", attempt)
-        last_overlay = overlay
-        review = cast(
-            TransformReview,
-            conversation.ask([source, overlay, crop], REVIEW_PROMPT, TransformReview, "review"),
-        )
-        if review.decision == "good_enough":
-            target_path = _transformed_path(source_path)
-            if verbose >= 1:
-                print(f"transforming {quote_display_path(source_path)} ...", end="")
-            try:
-                if not dry_run:
-                    crop.save(target_path)
-                if verbose >= 1:
-                    print("success!")
-            except OSError:
-                if verbose >= 1:
-                    print("error!")
-                return entry(overlay, crop, "Write failed", "Could not save the transformed image.", attempt, review)
-            status = "Transformed" if not dry_run else "Would transform"
-            return entry(overlay, crop, status, review.reason, attempt, review)
-        if review.decision == "no_transform_needed":
-            return entry(overlay, None, "No transform needed", review.reason, attempt, review)
-        if review.decision == "abandon":
-            return entry(overlay, crop, "Abandoned", review.reason, attempt, review)
-        corners_hint = review.replacement_corners
-        if corners_hint is None:
-            return entry(overlay, crop, "Abandoned", "Review requested adjustment without replacement corners.", attempt, review)
-    return entry(last_overlay, None, "Abandoned", "Maximum attempts reached without approval.", max_attempts)
+def _full_corners(size: tuple[int, int]) -> np.ndarray:
+    """Return source-image corner pixels in clockwise order."""
+    width, height = size
+    return np.asarray(
+        [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]],
+        dtype=np.float32,
+    )
 
 
-def _corners_for_attempt(
+def _background_hint(source: Image.Image) -> BackgroundHint:
+    """Summarize border color and variation for crop detection and fill."""
+    source_array = np.asarray(source)
+    edge_pixels = np.concatenate(
+        [source_array[0], source_array[-1], source_array[:, 0], source_array[:, -1]],
+    )
+    color = np.median(edge_pixels, axis=0).astype(np.uint8)
+    distances = np.linalg.norm(edge_pixels.astype(np.int16) - color.astype(np.int16), axis=1)
+    spread = float(np.percentile(distances, 90))
+    uniformity: Literal["uniform", "mostly_uniform", "varied"]
+    if spread <= 12:
+        uniformity = "uniform"
+    elif spread <= 35:
+        uniformity = "mostly_uniform"
+    else:
+        uniformity = "varied"
+    return BackgroundHint(
+        color_rgb=color.tolist(),
+        confidence=float(np.mean(distances <= 35)),
+        uniformity=uniformity,
+    )
+
+
+def detect_crop(
     source: Image.Image,
-    assessment: TransformAssessment,
-    corners_hint: list[Corner] | None,
-) -> np.ndarray | None:
-    """Prefer useful model corners, otherwise run the selected OpenCV detector."""
-    if corners_hint is not None:
-        return _validate_corners(np.asarray(corners_hint, dtype=np.float32), source.size)
+    *,
+    client: it.VisionModelClientAdapter,
+    verbose: int = 1,
+) -> CropDetection:
+    """Refine contour and Hough crop guesses with one structured VLM call."""
+    source = source.convert("RGB")
+    width, height = source.size
+    background = _background_hint(source)
     image = cv2.cvtColor(np.asarray(source), cv2.COLOR_RGB2BGR)
-    if assessment.strategy == "contour_quadrilateral":
-        return _detect_contour_corners(image, assessment.background)
-    return _detect_line_corners(image)
+    full_corners = _full_corners(source.size)
+    contour_corners = _detect_contour_corners(image, background)
+    hough_corners = _detect_line_corners(image, background)
+    contour_corners = full_corners if contour_corners is None else contour_corners
+    hough_corners = full_corners if hough_corners is None else hough_corners
+
+    def normalize(corners: np.ndarray) -> list[list[float]]:
+        """Scale pixel corners into source-relative coordinates."""
+        return [
+            [float(x) / max(1, width - 1), float(y) / max(1, height - 1)]
+            for x, y in corners
+        ]
+
+    guesses = {
+        "contour": normalize(contour_corners),
+        "hough": normalize(hough_corners),
+    }
+    result = client.vision_task(
+        [
+            it.base64_encode_image(source),
+            it.base64_encode_image(_draw_quadrilateral(source, contour_corners)),
+            it.base64_encode_image(_draw_quadrilateral(source, hough_corners)),
+        ],
+        CROP_VLM_PROMPT.format(guesses_json=json.dumps(guesses, indent=2)),
+        CropVlmDecision,
+    )
+    decision = CropVlmDecision.model_validate(result.data.model_dump())
+    if verbose >= 2:
+        print(f"VLM selected {decision.which}.")
+        print(f"VLM adjustments: {decision.adjustments}")
+    final_corners = np.asarray(
+        [[x * (width - 1), y * (height - 1)] for x, y in decision.points],
+        dtype=np.float32,
+    )
+    return CropDetection(
+        size=source.size,
+        background=background,
+        contour_corners=contour_corners,
+        hough_corners=hough_corners,
+        final_corners=final_corners,
+        which=decision.which,
+        adjustments=decision.adjustments,
+    )
+
+
+def _detection_edges(image: np.ndarray, background: BackgroundHint | None) -> np.ndarray:
+    """Find broad luminance edges, supplemented by a stable background color."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
+    if background is not None and background.uniformity != "varied":
+        background_bgr = np.array(background.color_rgb[::-1], dtype=np.uint8)
+        distance = np.linalg.norm(image.astype(np.int16) - background_bgr.astype(np.int16), axis=2)
+        foreground = (distance > 35).astype(np.uint8) * 255
+        foreground = cv2.morphologyEx(foreground, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        edges = cv2.bitwise_or(edges, cv2.morphologyEx(foreground, cv2.MORPH_GRADIENT, np.ones((3, 3), np.uint8)))
+    return edges
 
 
 def _detect_contour_corners(image: np.ndarray, background: BackgroundHint | None) -> np.ndarray | None:
     """Find a large four-sided external contour."""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 50, 150)
-    if background is not None and background.uniformity != "varied":
-        background_bgr = np.array(background.color_rgb[::-1], dtype=np.uint8)
-        distance = np.linalg.norm(image.astype(np.int16) - background_bgr.astype(np.int16), axis=2)
-        edges = cv2.bitwise_or(edges, (distance > 35).astype(np.uint8) * 255)
+    edges = _detection_edges(image, background)
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
     contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for contour in sorted(contours, key=cv2.contourArea, reverse=True):
@@ -331,13 +292,15 @@ def _detect_contour_corners(image: np.ndarray, background: BackgroundHint | None
     return None
 
 
-def _detect_line_corners(image: np.ndarray) -> np.ndarray | None:
+def _detect_line_corners(
+    image: np.ndarray,
+    background: BackgroundHint | None = None,
+) -> np.ndarray | None:
     """Fit four broad Hough side lines and intersect their extreme representatives."""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 50, 150)
+    edges = _detection_edges(image, background)
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 80, minLineLength=min(image.shape[:2]) // 4, maxLineGap=30)
     if lines is None:
-        return None
+        return _detect_contour_corners(image, background)
     horizontal: list[np.ndarray] = []
     vertical: list[np.ndarray] = []
     for raw_line in lines.reshape(-1, 4):
@@ -347,7 +310,7 @@ def _detect_line_corners(image: np.ndarray) -> np.ndarray | None:
         else:
             vertical.append(raw_line.astype(float))
     if len(horizontal) < 2 or len(vertical) < 2:
-        return None
+        return _detect_contour_corners(image, background)
     top, bottom = _extreme_lines(horizontal, axis=1)
     left, right = _extreme_lines(vertical, axis=0)
     corners = np.asarray([
@@ -450,44 +413,6 @@ def _draw_quadrilateral(source: Image.Image, corners: np.ndarray) -> Image.Image
     line_width = max(3, min(source.size) // 200)
     ImageDraw.Draw(overlay).line([*map(tuple, corners), tuple(corners[0])], fill=(0, 255, 0), width=line_width)
     return overlay
-
-
-def _transformed_path(source_path: Path) -> Path:
-    """Return the side-by-side filename for a transformed source image."""
-    return source_path.with_name(f"{source_path.stem}.transformed{source_path.suffix}")
-
-
-def _entry(
-    source_path: Path,
-    source: Image.Image,
-    overlay: Image.Image | None,
-    crop: Image.Image | None,
-    status: str,
-    reason: str,
-    attempts: int,
-    *,
-    assessment: TransformAssessment,
-    review: TransformReview | None,
-) -> TransformReviewEntry:
-    """Create a report entry with self-contained image data URLs."""
-    return TransformReviewEntry(
-        source_path,
-        _data_url(source),
-        _data_url(overlay),
-        _data_url(crop),
-        status,
-        reason,
-        attempts,
-        assessment.strategy,
-        assessment.parameters.model_dump_json(indent=2),
-        json.dumps(
-            assessment.background.model_dump(mode="json")
-            if assessment.background is not None
-            else None,
-            indent=2,
-        ),
-        review.decision if review is not None else None,
-    )
 
 
 def _data_url(image: Image.Image | None) -> str | None:

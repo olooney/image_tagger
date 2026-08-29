@@ -17,6 +17,9 @@ dedupe *args:
 clip *args:
     {{python}} src/cli.py clip {{args}}
 
+crop *args:
+    {{python}} src/cli.py crop {{args}}
+
 rename *args:
     {{python}} src/cli.py rename {{args}}
 

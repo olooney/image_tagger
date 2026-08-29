@@ -70,6 +70,22 @@
             border-bottom: 1px solid #444;
         }
         .crop-header h2 { min-width: 0; margin: 0; overflow-wrap: anywhere; font-size: 1.1rem; }
+        .crop-header-actions { display: flex; align-items: center; gap: 0.5rem; }
+        .crop-canvas-background {
+            width: 2.25rem;
+            height: 2.25rem;
+            padding: 0.4rem;
+            border: 1px solid #777;
+            background: transparent;
+            cursor: pointer;
+        }
+        .crop-background-swatch {
+            display: block;
+            width: 100%;
+            height: 100%;
+            border: 1px solid #fff;
+            background: #808080;
+        }
         .crop-mode-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
         .crop-close {
             width: 2.25rem;
@@ -86,6 +102,7 @@
             grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
             flex: 1;
             min-height: 0;
+            background: #808080;
         }
         .crop-pane {
             position: relative;
@@ -95,7 +112,7 @@
             align-items: center;
             justify-content: center;
             overflow: hidden;
-            background: #000;
+            background: inherit;
         }
         .crop-pane + .crop-pane { border-left: 1px solid #444; }
         .crop-pane canvas { display: block; max-width: 100%; max-height: 100%; }
@@ -169,8 +186,17 @@
                 previewTimer: null,
                 mode: 'perspective',
                 rectangleAspect: 1,
+                rectangleNaturalWidth: 1,
+                rectangleNaturalHeight: 1,
                 dragStartAspect: null,
+                canvasBackgroundIndex: 2,
             };
+
+            const canvasBackgrounds = [
+                { name: 'black', color: '#000000' },
+                { name: 'white', color: '#ffffff' },
+                { name: 'gray', color: '#666666' },
+            ];
 
             const modal = () => document.querySelector('#crop-modal');
             const sourceCanvas = () => document.querySelector('#crop-source-canvas');
@@ -180,7 +206,32 @@
             const loading = () => document.querySelector('#crop-loading');
             const outputWidthInput = () => document.querySelector('#crop-output-width');
             const outputHeightInput = () => document.querySelector('#crop-output-height');
+            const downsamplingSelect = () => document.querySelector('#crop-downsampling');
             const resultSize = () => document.querySelector('#crop-result-size');
+
+            const downsamplingRatios = [
+                ['80%', 0.8],
+                ['75%', 0.75],
+                ['60%', 0.6],
+                ['50%', 0.5],
+                ['33%', 0.33333333333],
+                ['25%', 0.25],
+            ];
+
+            const setCanvasBackground = () => {
+                const background = canvasBackgrounds[state.canvasBackgroundIndex];
+                document.querySelector('.crop-workspace').style.backgroundColor = background.color;
+                document.querySelector('#crop-background-swatch').style.backgroundColor = background.color;
+                const button = document.querySelector('#crop-canvas-background');
+                button.setAttribute('aria-label', `Canvas background: ${background.name}`);
+                button.title = `Canvas background: ${background.name}`;
+                renderSource();
+            };
+
+            const cycleCanvasBackground = () => {
+                state.canvasBackgroundIndex = (state.canvasBackgroundIndex + 1) % canvasBackgrounds.length;
+                setCanvasBackground();
+            };
 
             const selectAlgorithm = (algorithm) => {
                 document.querySelectorAll('[data-crop-detector]').forEach((button) => {
@@ -340,7 +391,7 @@
                 canvas.width = Math.max(1, Math.round(bounds.width));
                 canvas.height = Math.max(1, Math.round(bounds.height));
                 const context = canvas.getContext('2d');
-                context.fillStyle = '#000';
+                context.fillStyle = canvasBackgrounds[state.canvasBackgroundIndex].color;
                 context.fillRect(0, 0, canvas.width, canvas.height);
                 const scale = Math.max(0.01, Math.min(
                     (canvas.width - margin * 2) / state.image.naturalWidth,
@@ -420,23 +471,24 @@
                     sourceCanvas().setPointerCapture(event.pointerId);
                     return;
                 }
-                if (state.mode === 'rectangle') {
-                    const edges = [[0, 1], [1, 2], [2, 3], [3, 0]];
-                    let closestEdge = null;
-                    let closestEdgeDistance = 12;
-                    edges.forEach(([start, end], index) => {
-                        const distance = pointToSegmentDistance(pointer, points[start], points[end]);
-                        if (distance < closestEdgeDistance) {
-                            closestEdge = index;
-                            closestEdgeDistance = distance;
-                        }
-                    });
-                    if (closestEdge !== null) {
+                const edges = [[0, 1], [1, 2], [2, 3], [3, 0]];
+                let closestEdge = null;
+                let closestEdgeDistance = 12;
+                edges.forEach(([start, end], index) => {
+                    const distance = pointToSegmentDistance(pointer, points[start], points[end]);
+                    if (distance < closestEdgeDistance) {
+                        closestEdge = index;
+                        closestEdgeDistance = distance;
+                    }
+                });
+                if (closestEdge !== null) {
+                    state.lastTouchedHandle = { type: 'edge', index: closestEdge };
+                    if (state.mode === 'rectangle') {
                         state.draggedHandle = { type: 'edge', index: closestEdge };
-                        state.lastTouchedHandle = state.draggedHandle;
                         state.dragStartAspect = null;
                         sourceCanvas().setPointerCapture(event.pointerId);
                     }
+                    renderSource();
                 }
             };
 
@@ -489,12 +541,28 @@
                 state.points = [[left, top], [right, top], [right, bottom], [left, bottom]];
             };
 
+            const targetDownsamplingSize = (ratio) => [
+                Math.max(1, Math.round(state.rectangleNaturalWidth * ratio)),
+                Math.max(1, Math.round(state.rectangleNaturalHeight * ratio)),
+            ];
+
+            const syncDownsamplingOptions = () => {
+                downsamplingSelect().querySelectorAll('option[data-ratio]').forEach((option) => {
+                    const [width, height] = targetDownsamplingSize(Number.parseFloat(option.value));
+                    option.textContent = `${option.dataset.label} - (${width}x${height})`;
+                });
+                downsamplingSelect().value = '';
+            };
+
             const syncRectangleDimensions = () => {
                 const width = Math.max(1, Math.round(state.points[1][0] - state.points[0][0] + 1));
                 const height = Math.max(1, Math.round(state.points[3][1] - state.points[0][1] + 1));
                 state.rectangleAspect = width / height;
+                state.rectangleNaturalWidth = width;
+                state.rectangleNaturalHeight = height;
                 outputWidthInput().value = width;
                 outputHeightInput().value = height;
+                syncDownsamplingOptions();
             };
 
             const pointerMove = (event) => {
@@ -546,6 +614,14 @@
                         Math.max(-overscan, Math.min(state.image.naturalWidth + overscan, point[0] + offset[0])),
                         Math.max(-overscan, Math.min(state.image.naturalHeight + overscan, point[1] + offset[1])),
                     ], event.shiftKey);
+                } else if (state.mode === 'perspective') {
+                    const [start, end] = [[0, 1], [1, 2], [2, 3], [3, 0]][handle.index];
+                    [start, end].forEach((index) => {
+                        state.points[index] = [
+                            Math.max(-overscan, Math.min(state.image.naturalWidth + overscan, state.points[index][0] + offset[0])),
+                            Math.max(-overscan, Math.min(state.image.naturalHeight + overscan, state.points[index][1] + offset[1])),
+                        ];
+                    });
                 } else if ((handle.index === 0 || handle.index === 2) && offset[1]) {
                     setEdge(handle.index, [point[0], point[1] + offset[1]]);
                 } else if ((handle.index === 1 || handle.index === 3) && offset[0]) {
@@ -593,6 +669,8 @@
 
             const open = async (rowId) => {
                 state.rowId = rowId;
+                state.canvasBackgroundIndex = 2;
+                setCanvasBackground();
                 errorBox().textContent = '';
                 selectAlgorithm(null);
                 selectMode('rectangle');
@@ -663,7 +741,7 @@
 
             const detect = async (algorithm, button) => {
                 if (!state.rowId) return;
-                if ((algorithm === 'hough' || algorithm === 'contour') && state.mode === 'rectangle') {
+                if ((algorithm === 'hough' || algorithm === 'contour' || algorithm === 'llm') && state.mode === 'rectangle') {
                     selectMode('perspective');
                 }
                 if (algorithm === 'full') {
@@ -686,7 +764,7 @@
                 const detectorButtons = document.querySelectorAll('[data-crop-detector]');
                 detectorButtons.forEach((detectorButton) => { detectorButton.disabled = true; });
                 errorBox().textContent = '';
-                loading().textContent = algorithm === 'llm' ? 'Asking the LLM...' : 'Detecting edges...';
+                loading().textContent = algorithm === 'llm' ? 'Asking the VLM...' : 'Detecting edges...';
                 loading().hidden = false;
                 try {
                     const response = await fetch(`/row/${state.rowId}/clip?algorithm=${algorithm}`);
@@ -718,6 +796,14 @@
                 sourceCanvas().addEventListener('pointerup', pointerUp);
                 sourceCanvas().addEventListener('pointercancel', pointerUp);
                 colorInput().addEventListener('input', bufferPreview);
+                document.querySelector('#crop-canvas-background').addEventListener('click', cycleCanvasBackground);
+                downsamplingSelect().addEventListener('change', () => {
+                    if (!downsamplingSelect().value) return;
+                    const [width, height] = targetDownsamplingSize(Number.parseFloat(downsamplingSelect().value));
+                    outputWidthInput().value = width;
+                    outputHeightInput().value = height;
+                    renderPreview();
+                });
                 document.querySelectorAll('[data-crop-mode]').forEach((button) => {
                     button.addEventListener('click', () => selectMode(button.dataset.cropMode));
                 });
@@ -725,12 +811,14 @@
                     const width = Math.max(1, Number.parseInt(outputWidthInput().value, 10) || 1);
                     outputWidthInput().value = width;
                     outputHeightInput().value = Math.max(1, Math.round(width / state.rectangleAspect));
+                    downsamplingSelect().value = '';
                     renderPreview();
                 });
                 outputHeightInput().addEventListener('blur', () => {
                     const height = Math.max(1, Number.parseInt(outputHeightInput().value, 10) || 1);
                     outputHeightInput().value = height;
                     outputWidthInput().value = Math.max(1, Math.round(height * state.rectangleAspect));
+                    downsamplingSelect().value = '';
                     renderPreview();
                 });
                 document.querySelector('#crop-close').addEventListener('click', close);
@@ -818,7 +906,12 @@
         <div class="crop-dialog">
             <div class="crop-header">
                 <h2 id="crop-title">Crop Tool</h2>
-                <button id="crop-close" class="crop-close" type="button" aria-label="Close" title="Close">&times;</button>
+                <div class="crop-header-actions">
+                    <button id="crop-canvas-background" class="crop-canvas-background" type="button" aria-label="Canvas background: gray" title="Canvas background: gray">
+                        <span id="crop-background-swatch" class="crop-background-swatch" aria-hidden="true"></span>
+                    </button>
+                    <button id="crop-close" class="crop-close" type="button" aria-label="Close" title="Close">&times;</button>
+                </div>
             </div>
             <div class="crop-workspace">
                 <div class="crop-pane">
@@ -839,9 +932,9 @@
                 <div class="crop-detectors" role="group" aria-label="Crop boundary detection">
                     <button type="button" class="btn btn-outline-light" data-crop-detector="hough" aria-pressed="false">Hough</button>
                     <button type="button" class="btn btn-outline-light" data-crop-detector="contour" aria-pressed="false">Contour</button>
+                    <button type="button" class="btn btn-outline-light" data-crop-detector="llm" aria-pressed="false">VLM</button>
                 </div>
                 <div id="perspective-tools" class="crop-detectors" hidden>
-                    <button type="button" class="btn btn-outline-light" data-crop-detector="llm" aria-pressed="false">LLM</button>
                     <button type="button" class="btn btn-outline-light" data-crop-detector="full" aria-pressed="false">Full</button>
                     <label for="crop-background">Background <input id="crop-background" type="color" value="#ffffff"></label>
                 </div>
@@ -850,6 +943,17 @@
                     <label for="crop-output-width">W <input id="crop-output-width" class="form-control form-control-sm" type="number" min="1" value="1"></label>
                     <span>&times;</span>
                     <label for="crop-output-height">H <input id="crop-output-height" class="form-control form-control-sm" type="number" min="1" value="1"></label>
+                    <label for="crop-downsampling">
+                        <select id="crop-downsampling" class="form-control form-control-sm" aria-label="Downsampling ratio">
+                            <option value="">Downsample</option>
+                            <option value="0.8" data-ratio data-label="80%">80%</option>
+                            <option value="0.75" data-ratio data-label="75%">75%</option>
+                            <option value="0.6" data-ratio data-label="60%">60%</option>
+                            <option value="0.5" data-ratio data-label="50%">50%</option>
+                            <option value="0.33333333333" data-ratio data-label="33%">33%</option>
+                            <option value="0.25" data-ratio data-label="25%">25%</option>
+                        </select>
+                    </label>
                 </div>
                 <output id="crop-result-size" class="image-dimensions" aria-label="Result size">1x1</output>
                 <div id="crop-error" class="crop-error" role="alert"></div>

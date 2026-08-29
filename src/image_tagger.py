@@ -2214,6 +2214,7 @@ def shelve_images(
     verbose: int = 1,
     dry_run: bool = False,
     review_ids: set[str] | None = None,
+    prune_verbose: int | None = None,
 ) -> None:
     """Move images into category folders, while keeping the current shelf scoped."""
     csv_path = Path(csv_filename)
@@ -2308,7 +2309,10 @@ def shelve_images(
             traceback.print_exc()
 
     if not dry_run:
-        prune_metadata_rows(csv_path, verbose=verbose)
+        prune_metadata_rows(
+            csv_path,
+            verbose=verbose if prune_verbose is None else prune_verbose,
+        )
 
 
 def generate_gallery(

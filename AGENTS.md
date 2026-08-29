@@ -2,6 +2,7 @@
 
 - Prefer focused changes in `src/cli.py`, `src/image_tagger.py`, and `tests/test_cli_workflow.py`; this project keeps most workflow coverage in one end-to-end test file.
 - Default CLI verbosity is `1`; preserve quiet/progress output behavior when adding workflow features.
+- CLI handlers receive the final `args.verbose` integer after `-v`/`-q` deltas are resolved; pass it explicitly through long-running functions rather than reading CLI globals.
 - For command-line display of filenames, use `quote_display_path()` so paths are quoted only when needed.
 - For file operations, print the operation with ` ...` and no newline before running it, then print `success!` or `error!` after.
 - Keep Python functions and methods annotated with terse necessary docstrings; annotate module globals when adding them.

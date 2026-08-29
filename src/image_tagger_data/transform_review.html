@@ -7,18 +7,17 @@
     <style>
         body { margin: 0; color: #1f2933; background: #f5f4ef; font-family: Georgia, serif; }
         header { padding: 1rem 2rem; color: #fff; background: #174c42; }
-        main { max-width: 1500px; margin: 2rem auto; padding: 0 1rem; }
-        article { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; padding: 1rem 0 2rem; border-bottom: 1px solid #b8b6ae; }
+        main { max-width: 1900px; margin: 2rem auto; padding: 0 1rem; }
+        article { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1rem; padding: 1rem 0 2rem; border-bottom: 1px solid #b8b6ae; }
         figure { margin: 0; min-width: 0; }
         .image-frame { display: flex; align-items: center; justify-content: center; height: min(720px, 140vw); background: #d9d7cf; }
         .image-frame img { display: block; width: 100%; height: 100%; object-fit: contain; }
         figcaption { margin-top: .5rem; font-family: sans-serif; font-size: .9rem; overflow-wrap: anywhere; }
         .details { grid-column: 1 / -1; font-family: sans-serif; }
         .status { font-weight: 700; color: #174c42; }
-        .metadata { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; margin-top: .75rem; }
-        .metadata p { margin: 0; overflow-wrap: anywhere; }
-        pre { margin: .25rem 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
-        @media (max-width: 800px) { article, .metadata { grid-template-columns: 1fr; } }
+        .details p { margin: .5rem 0 0; overflow-wrap: anywhere; }
+        @media (max-width: 1000px) { article { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+        @media (max-width: 600px) { article { grid-template-columns: 1fr; } }
     </style>
 </head>
 <body>
@@ -26,16 +25,14 @@
     <main>
         {% for entry in entries %}
             <article>
-                <figure><div class="image-frame"><img src="{{ entry.source_image_src }}" alt="Original image"></div><figcaption>Original: {{ entry.source_path.name }}</figcaption></figure>
-                <figure><div class="image-frame">{% if entry.overlay_image_src %}<img src="{{ entry.overlay_image_src }}" alt="Original with detected quadrilateral">{% endif %}</div><figcaption>Detected boundary</figcaption></figure>
-                <figure><div class="image-frame">{% if entry.transformed_image_src %}<img src="{{ entry.transformed_image_src }}" alt="Perspective-corrected crop">{% endif %}</div><figcaption>Transformed crop</figcaption></figure>
-                <div class="details"><span class="status">{{ entry.status }}</span> after {{ entry.attempts }} attempt{% if entry.attempts != 1 %}s{% endif %}. {{ entry.reason }}
-                    <div class="metadata">
-                        <p><strong>Algorithm:</strong> {{ entry.strategy }}</p>
-                        <p><strong>Final review:</strong> {{ entry.review_decision or "not requested" }}</p>
-                        <p><strong>Parameters:</strong><pre>{{ entry.parameters_json }}</pre></p>
-                        <p><strong>Background:</strong><pre>{{ entry.background_json }}</pre></p>
-                    </div>
+                <figure><div class="image-frame"><img src="{{ entry.hough_image_src }}" alt="Hough crop guess"></div><figcaption>Hough guess: {{ entry.source_path.name }}</figcaption></figure>
+                <figure><div class="image-frame"><img src="{{ entry.contour_image_src }}" alt="Contour crop guess"></div><figcaption>Contour guess</figcaption></figure>
+                <figure><div class="image-frame"><img src="{{ entry.vlm_image_src }}" alt="VLM crop guess"></div><figcaption>VLM guess</figcaption></figure>
+                <figure><div class="image-frame">{% if entry.transformed_image_src %}<img src="{{ entry.transformed_image_src }}" alt="Final perspective crop">{% endif %}</div><figcaption>Final crop</figcaption></figure>
+                <div class="details">
+                    <span class="status">{{ entry.status }}</span>
+                    <p><strong>VLM selected:</strong> {{ entry.which }}</p>
+                    <p><strong>Adjustments:</strong> {{ entry.adjustments }}</p>
                 </div>
             </article>
         {% else %}

@@ -137,11 +137,10 @@ def dedupe_uploads(args: argparse.Namespace) -> None:
 
 
 def transform_uploads(args: argparse.Namespace) -> None:
-    """Perspective-correct upload images using vision-model guidance."""
+    """Perspective-correct images with one CV-assisted VLM pass."""
     transform.transform_images(
         args.directory,
         provider=it.VisionModelProvider(args.provider),
-        max_attempts=args.max_attempts,
         verbose=args.verbose,
         dry_run=args.dry_run,
     )
@@ -248,7 +247,12 @@ def report_uploads(args: argparse.Namespace) -> None:
 
 def review_uploads(args: argparse.Namespace) -> None:
     """Serve an editable metadata review app."""
-    review_app.review_metadata(args.metadata_filename, stackmap=args.stackmap_config)
+    review_app.review_metadata(
+        args.metadata_filename,
+        stackmap=args.stackmap_config,
+        provider=args.provider,
+        verbose=args.verbose,
+    )
 
 
 def clean_uploads(args: argparse.Namespace) -> None:
@@ -356,7 +360,8 @@ def build_parser() -> argparse.ArgumentParser:
     dedupe_parser.set_defaults(func=dedupe_uploads)
 
     transform_parser = subparsers.add_parser(
-        "clip",
+        "crop",
+        aliases=["clip"],
         help="Perspective-correct rectangular images with a vision model and OpenCV.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -365,13 +370,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--provider",
         choices=["openai", "gemma", "qwen"],
         default="openai",
-        help="Vision model provider for routing and crop review.",
-    )
-    transform_parser.add_argument(
-        "--max-attempts",
-        type=int,
-        default=transform.DEFAULT_MAX_ATTEMPTS,
-        help="Maximum crop attempts for each image.",
+        help="Vision model provider for crop adjudication.",
     )
     transform_parser.add_argument(
         "--preview", action=argparse.BooleanOptionalAction, default=True
@@ -432,6 +431,12 @@ def build_parser() -> argparse.ArgumentParser:
         "review", help="Serve an editable metadata review app."
     )
     add_common_upload_args(review_parser)
+    review_parser.add_argument(
+        "--provider",
+        choices=["openai", "gemma", "qwen"],
+        default="openai",
+        help="Vision model provider for interactive crop review.",
+    )
     review_parser.set_defaults(func=review_uploads)
 
     wall_parser = subparsers.add_parser(

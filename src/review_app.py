@@ -63,24 +63,17 @@ class ClipRequest(BaseModel):
     resampling: Literal["nearest", "bilinear", "bicubic", "lanczos"] = "lanczos"
 
 
-class ClipCoordinates(BaseModel):
-    """Corners and background returned for interactive clipping."""
-
-    points: list[transform.Corner] = Field(min_length=4, max_length=4)
-    background_color_rgb: transform.RgbColor
-
-
-CLIP_COORDINATES_PROMPT: str = """Identify the four corners of the main flat rectangular subject in this image.
-Return its source-image pixel coordinates in top-left, top-right, bottom-right, bottom-left order.
-Corners may be outside the image when perspective correction requires extrapolation.
-Also infer the RGB color immediately outside the subject for filling extrapolated pixels.
-Return exactly four points and one background RGB color; make no other decisions."""
-
-
-def set_review_metadata(metadata_filename: Pathish, stackmap: StackMap) -> None:
+def set_review_metadata(
+    metadata_filename: Pathish,
+    stackmap: StackMap,
+    provider: it.VisionModelProvider | str = it.VisionModelProvider.OPENAI,
+    verbose: int = 1,
+) -> None:
     """Set the metadata file used by the review app."""
     app.state.metadata_path = Path(metadata_filename)
     app.state.stackmap = stackmap
+    app.state.provider = it.VisionModelProvider(provider)
+    app.state.verbose = verbose
 
 
 def review_metadata_path() -> Path:
@@ -97,6 +90,19 @@ def review_stackmap() -> StackMap:
     if stackmap is None:
         raise RuntimeError("Review stack map has not been configured.")
     return cast("StackMap", stackmap)
+
+
+def review_provider() -> it.VisionModelProvider:
+    """Return the configured review vision-model provider."""
+    return cast(
+        "it.VisionModelProvider",
+        getattr(app.state, "provider", it.VisionModelProvider.OPENAI),
+    )
+
+
+def review_verbose() -> int:
+    """Return the configured review verbosity."""
+    return cast("int", getattr(app.state, "verbose", 1))
 
 
 def first_available_port(start_port: int = 8001) -> int:
@@ -251,49 +257,29 @@ def review_row_image_path(metadata_path: Path, row_id: str) -> Path:
 def detect_clip_corners(
     image_path: Path,
     algorithm: Literal["hough", "contour", "llm"] = "hough",
+    provider: it.VisionModelProvider = it.VisionModelProvider.OPENAI,
+    verbose: int = 1,
 ) -> tuple[tuple[int, int], list[list[float]], str | None]:
     """Return image dimensions and detected perspective corners."""
     with Image.open(image_path) as opened_image:
         source = opened_image.convert("RGB")
-    source_array = np.asarray(source)
-    edge_pixels = np.concatenate(
-        [
-            source_array[0, :, :],
-            source_array[-1, :, :],
-            source_array[:, 0, :],
-            source_array[:, -1, :],
-        ],
-    )
-    edge_color = np.median(edge_pixels, axis=0).astype(np.uint8)
-    background: str | None = "#{:02x}{:02x}{:02x}".format(*edge_color)
+    background_hint = transform._background_hint(source)
+    background: str | None = "#{:02x}{:02x}{:02x}".format(*background_hint.color_rgb)
     if algorithm == "llm":
-        client = it.get_vision_model_client_adapter(it.VisionModelProvider.OPENAI)
-        result = client.vision_task(
-            it.base64_encode_image(source),
-            CLIP_COORDINATES_PROMPT,
-            ClipCoordinates,
-        )
-        coordinates = ClipCoordinates.model_validate(result.data.model_dump())
-        corners = np.asarray(coordinates.points, dtype=np.float32)
-        corners = transform._validate_corners(corners, source.size)
-        if corners is None:
-            raise ValueError("The LLM returned invalid crop coordinates for this image.")
-        background = "#{:02x}{:02x}{:02x}".format(
-            *(max(0, min(255, value)) for value in coordinates.background_color_rgb)
-        )
+        client = it.get_vision_model_client_adapter(provider)
+        detection = transform.detect_crop(source, client=client, verbose=verbose)
+        corners = detection.final_corners
+        background_hint = detection.background
+        background = "#{:02x}{:02x}{:02x}".format(*background_hint.color_rgb)
     else:
-        image = cv2.cvtColor(source_array, cv2.COLOR_RGB2BGR)
+        image = cv2.cvtColor(np.asarray(source), cv2.COLOR_RGB2BGR)
         corners = (
-            transform._detect_line_corners(image)
+            transform._detect_line_corners(image, background_hint)
             if algorithm == "hough"
-            else transform._detect_contour_corners(image, None)
+            else transform._detect_contour_corners(image, background_hint)
         )
     if corners is None:
-        width, height = source.size
-        corners = np.asarray(
-            [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]],
-            dtype=np.float32,
-        )
+        corners = transform._full_corners(source.size)
     return source.size, corners.tolist(), background
 
 
@@ -610,7 +596,12 @@ async def clip_details(
     """Return source geometry and detected clip points without altering the image."""
     try:
         image_path = review_row_image_path(review_metadata_path(), row_id)
-        (width, height), points, background = detect_clip_corners(image_path, algorithm)
+        (width, height), points, background = detect_clip_corners(
+            image_path,
+            algorithm,
+            provider=review_provider(),
+            verbose=review_verbose(),
+        )
         return {
             "width": width,
             "height": height,
@@ -621,9 +612,10 @@ async def clip_details(
         raise HTTPException(status_code=404, detail=str(error)) from error
     except Exception as error:
         LOGGER.exception("Failed to detect %s crop for row %s.", algorithm, row_id)
+        detector_name = "VLM" if algorithm == "llm" else algorithm.upper()
         raise HTTPException(
             status_code=502,
-            detail=f"{algorithm.upper()} detection failed: {error}",
+            detail=f"{detector_name} detection failed: {error}",
         ) from error
 
 
@@ -667,6 +659,7 @@ async def shelve_row(row_id: str) -> str:
             stackmap=review_stackmap(),
             verbose=2,
             review_ids={row_id},
+            prune_verbose=0,
         )
     output = stdout.getvalue().strip() or "No image moved."
     return (
@@ -680,6 +673,8 @@ def review_metadata(
     metadata_filename: Pathish,
     *,
     stackmap: StackMap,
+    provider: it.VisionModelProvider | str = it.VisionModelProvider.OPENAI,
+    verbose: int = 1,
     start_port: int = 8001,
 ) -> None:
     """Serve a local metadata review app and open it in a browser."""
@@ -693,7 +688,12 @@ def review_metadata(
         return
     ensure_review_metadata(metadata_path, image_paths)
     backup_path = metadata_path.with_suffix(f"{metadata_path.suffix}.bak")
-    set_review_metadata(metadata_path, stackmap)
+    set_review_metadata(
+        metadata_path,
+        stackmap,
+        provider=provider,
+        verbose=verbose,
+    )
     port = first_available_port(start_port)
     url = f"http://127.0.0.1:{port}"
     webbrowser.open(url)
