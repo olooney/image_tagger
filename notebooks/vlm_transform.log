@@ -1,0 +1,48 @@
+INFO:     127.0.0.1:52883 - "GET /images/61V%2B8dAGjJL._SL1000_.jpg?v=1788011388497 HTTP/1.1" 200 OK
+VLM selected contour.
+VLM adjustments: Extend the top-left corner leftward and slightly upward to the true cover edge. Raise the top-right slightly, and make minor outward adjustments at the lower corners to follow the visible cover boundary.
+INFO:     127.0.0.1:52883 - "GET /row/01a04d81-71cc-776e-8f1b-c594d93445c8/clip?algorithm=llm HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64928 - "GET /images/622f30ddd534c2ba69bd99b7411fbc7e.jpg?v=1788011410984 HTTP/1.1" 200 OK
+VLM selected hough.
+VLM adjustments: The Hough guess follows the top and side edges reasonably well, but its bottom edge cuts through the cover. Extend both lower corners down to the actual bottom corners, while slightly refining the top and side positions to match the cover boundary.
+INFO:     127.0.0.1:64928 - "GET /row/01a04d81-71cd-7473-b02a-212ee6c68604/clip?algorithm=llm HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52049 - "GET /images/9c34bbd8ccb8a88e89be596afadc8dc4.jpg?v=1788011435418 HTTP/1.1" 200 OK
+VLM selected neither.
+VLM adjustments: Both guesses incorrectly use the full image. Tighten the crop to the visible outer perimeter of the front cover: follow the slightly slanted top, left, and right edges, and use the image bottom where the cover continues beyond the frame.
+INFO:     127.0.0.1:52049 - "GET /row/01a04d81-71cd-7473-b02a-21309110a3e7/clip?algorithm=llm HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52049 - "GET /images/b09ce0215ab44b70c474061743c82a85.jpg?v=1788011454034 HTTP/1.1" 200 OK
+VLM selected hough.
+VLM adjustments: Use the Hough estimate as the starting shape. Move the top-left corner inside the image onto the book’s upper-left corner, keep the top-right near the visible upper-right corner, and expand both lower corners substantially outward to follow the full bottom and side edges of the cover.
+INFO:     127.0.0.1:52049 - "GET /row/01a04d81-71cd-7473-b02a-213229dbea7d/clip?algorithm=llm HTTP/1.1" 200 OK
+INFO:     127.0.0.1:52221 - "GET /images/b4d125e7306cc5c395c810ae97f1ffb3.jpg?v=1788011489232 HTTP/1.1" 200 OK
+VLM selected hough.
+VLM adjustments: The Hough guess is closer to the cover’s perspective, but its top-left point lies outside the image and its bottom edge cuts through the artwork. Move the top corners onto the visible upper cover edge, align the left edge with the front-cover/spine hinge, extend the right edge to the actual lower-right corner, and place the bottom-left point where the partially off-frame lower edge meets the image boundary.
+INFO:     127.0.0.1:52221 - "GET /row/01a04d81-71cd-7473-b02a-213469b958d1/clip?algorithm=llm HTTP/1.1" 200 OK
+INFO:     127.0.0.1:49447 - "GET /images/b80f0c2c54189259947132d0befc9e1a.jpg?v=1788011745289 HTTP/1.1" 200 OK
+VLM selected neither.
+VLM adjustments: The contour includes the entire scene, while the Hough guess captures only the cover’s central area. Fit the quadrilateral to the visible outer cover edges; the upper-right corner is clipped by the image boundary, so place it at the top-edge intersection.
+INFO:     127.0.0.1:49447 - "GET /row/01a04d81-71cd-7473-b02a-213632147530/clip?algorithm=llm HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64077 - "GET /images/ba13b22cab729ef2182d5e2386837189.jpg?v=1788011768891 HTTP/1.1" 200 OK
+VLM selected contour.
+VLM adjustments: The image is already tightly cropped to the full front cover. Keep the full-image bounds; the Hough guess unnecessarily cuts into the lower-left portion of the cover.
+INFO:     127.0.0.1:64077 - "GET /row/01a04d81-71ce-77ad-9072-1fff040b243b/clip?algorithm=llm HTTP/1.1" 200 OK
+INFO:     127.0.0.1:64080 - "GET /images/bdc102288244edad6e193c53f710d387.jpg?v=1788011785847 HTTP/1.1" 200 OK
+VLM selected hough.
+VLM adjustments: The Hough guess closely follows the cover. Move the top-left corner slightly right to align with the visible cover edge; keep the other corners essentially unchanged.
+INFO:     127.0.0.1:64080 - "GET /row/01a04d81-71ce-77ad-9072-2000aaeb49f8/clip?algorithm=llm HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60167 - "GET /images/cf5e78846ad4e8c66973dd75d2ef6c8d.jpg?v=1788011807761 HTTP/1.1" 200 OK
+VLM selected contour.
+VLM adjustments: The contour guess follows the cover most closely. Keep the top-left nearly unchanged, extend the top-right slightly right, and move both lower corners downward—especially the bottom-right—to include the full worn, rounded cover edge.
+INFO:     127.0.0.1:60167 - "GET /row/01a04d81-71ce-77ad-9072-2002a4042f83/clip?algorithm=llm HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53085 - "GET /images/d6db8e99ca26874408311606aabddc3b.jpg?v=1788011832508 HTTP/1.1" 200 OK
+VLM selected neither.
+VLM adjustments: The contour guess is the entire image and includes surrounding background, while the Hough guess captures only the upper title area. Replace both with a quadrilateral following the visible outer edges of the full front cover, including its perspective-skewed top and bottom edges.
+INFO:     127.0.0.1:53085 - "GET /row/01a04d81-71ce-77ad-9072-2004c08716c8/clip?algorithm=llm HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53097 - "GET /images/e708dcc88e85c5bd3dafdec8fdd95d26.jpg?v=1788011903303 HTTP/1.1" 200 OK
+VLM selected hough.
+VLM adjustments: The Hough guess follows the book's perspective better, but it is too wide at the top and includes the visible lower board thickness. Move both top corners inward to the actual cover corners, and raise/inset the bottom corners to the cream front-cover edge.
+INFO:     127.0.0.1:53097 - "GET /row/01a04d81-71cf-70f2-bdc6-98a8f4b5249f/clip?algorithm=llm HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53105 - "GET /images/fca9dca3720f7f5e7ba43d6d0914d0d2.jpg?v=1788011924474 HTTP/1.1" 200 OK
+VLM selected hough.
+VLM adjustments: The Hough guess is closer, but it includes the left spine/background and a large area containing the robot. Move the left corners right to the front-face edge, move the right corners left to the cover’s right edge, and align all corners with the cover’s visible top and bottom boundaries.
+INFO:     127.0.0.1:53106 - "GET /row/01a04d81-71cf-70f2-bdc6-98aabd8da65e/clip?algorithm=llm HTTP/1.1" 200 OK

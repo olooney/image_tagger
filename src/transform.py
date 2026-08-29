@@ -2,6 +2,7 @@
 
 import base64
 import json
+import time
 from dataclasses import dataclass
 from importlib import resources
 from io import BytesIO
@@ -13,6 +14,7 @@ import jinja2
 import numpy as np
 from PIL import Image, ImageDraw
 from pydantic import BaseModel, Field
+from send2trash import send2trash
 
 import image_tagger as it
 from constants import WELCOME_EXTENSIONS
@@ -158,15 +160,23 @@ def _transform_one_image(
         status = "Would transform" if dry_run else "Transformed"
         if verbose >= 1:
             print(f"transforming {quote_display_path(source_path)} ...", end="")
+        temporary_path = source_path.with_name(
+            f".{source_path.stem}.crop-{time.time_ns()}{source_path.suffix}"
+        )
         try:
             if not dry_run:
-                crop.save(source_path)
+                crop.save(temporary_path)
+                send2trash(source_path)
+                temporary_path.replace(source_path)
             if verbose >= 1:
                 print("success!")
-        except OSError:
+        except Exception:
             if verbose >= 1:
                 print("error!")
             status = "Write failed"
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
     return TransformReviewEntry(
         source_path=source_path,
         hough_image_src=_data_url(hough_overlay),

@@ -5,12 +5,15 @@ import os
 import re
 import shutil
 import sys
+import uuid
 from collections.abc import Callable
 from contextlib import redirect_stdout
 from io import BytesIO, StringIO
 from pathlib import Path
+from typing import cast
 
 import numpy as np
+import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -168,14 +171,20 @@ class MockSameImageClientAdapter(it.VisionModelClientAdapter):
 
 
 class MockTransformClientAdapter(it.VisionModelClientAdapter):
-    """Vision adapter returning an accepted perspective transform."""
+    """Vision adapter returning one normalized crop decision."""
 
     provider_name = "Mock"
     model = "mock-transform"
 
-    def __init__(self) -> None:
+    def __init__(self, points: list[list[float]] | None = None) -> None:
         """Start with no recorded transform requests."""
         self.calls: list[list[str] | str] = []
+        self.points = points or [
+            [0.05, 0.05],
+            [0.95, 0.05],
+            [0.95, 0.95],
+            [0.05, 0.95],
+        ]
 
     def vision_task(
         self,
@@ -183,28 +192,13 @@ class MockTransformClientAdapter(it.VisionModelClientAdapter):
         prompt: str,
         response_format: type[BaseModel],
     ) -> it.VisionTaskResult:
-        """Return an initial corner estimate then an accepted review."""
+        """Return one refined crop from the supplied CV guesses."""
         self.calls.append(image_base64)
-        if response_format is transform.TransformAssessment:
-            content = {
-                "strategy": "contour_quadrilateral",
-                "confidence": 0.9,
-                "reason": "Clear rectangle.",
-                "approximate_corners": [[5, 5], [95, 5], [95, 95], [5, 95]],
-                "background": None,
-                "parameters": {
-                    "edge_strength": None,
-                    "expected_boundary_completeness": None,
-                    "notes": None,
-                },
-            }
-        else:
-            content = {
-                "decision": "good_enough",
-                "confidence": 0.9,
-                "reason": "Crop is square and front-facing.",
-                "replacement_corners": None,
-            }
+        content = {
+            "which": "contour",
+            "adjustments": "Inset the cover edges.",
+            "points": self.points,
+        }
         return it.VisionTaskResult(
             data=response_format.model_validate(content),
             model=self.model,
@@ -275,15 +269,21 @@ def test_clip_comparison_defers_model_loading() -> None:
     assert comparison_method.client is None
 
 
-def test_transform_images_writes_reviewed_sibling_and_skips_transformed_files(
+def test_transform_images_overwrites_source_and_writes_debug_report(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Create one reviewed transform without treating its output as a new input."""
-    source_path = tmp_path / "book.jpg"
+    """Apply one shared VLM crop and report all three guesses plus the result."""
+    source_path = tmp_path / "book.png"
     Image.new("RGB", (100, 100), "white").save(source_path)
-    skipped_path = tmp_path / "already.transformed.jpg"
-    Image.new("RGB", (100, 100), "black").save(skipped_path)
     client = MockTransformClientAdapter()
+    trashed_paths: list[Path] = []
+
+    def fake_send2trash(path: Path) -> None:
+        trashed_paths.append(path)
+        path.unlink()
+
+    monkeypatch.setattr(transform, "send2trash", fake_send2trash)
 
     entries = transform.transform_images(
         tmp_path,
@@ -291,18 +291,115 @@ def test_transform_images_writes_reviewed_sibling_and_skips_transformed_files(
         verbose=0,
     )
 
-    target_path = tmp_path / "book.transformed.jpg"
-    assert target_path.is_file()
     assert len(entries) == 1
     assert entries[0].status == "Transformed"
-    assert len(client.calls) == 2
-    assert isinstance(client.calls[0], list) and len(client.calls[0]) == 1
-    assert isinstance(client.calls[1], list) and len(client.calls[1]) == 3
+    assert len(client.calls) == 1
+    assert isinstance(client.calls[0], list) and len(client.calls[0]) == 3
+    assert trashed_paths == [source_path]
+    with Image.open(source_path) as transformed:
+        assert transformed.size == (89, 89)
     review_html = (tmp_path / transform.TRANSFORM_REVIEW_FILENAME).read_text()
     assert "Perspective Transform Review" in review_html
-    assert "book.jpg" in review_html
-    assert "contour_quadrilateral" in review_html
-    assert "good_enough" in review_html
+    assert "book.png" in review_html
+    assert "Hough guess" in review_html
+    assert "Contour guess" in review_html
+    assert "VLM guess" in review_html
+    assert "Final crop" in review_html
+    assert "Inset the cover edges." in review_html
+    assert "attempt" not in review_html
+
+
+def test_transform_images_dry_run_only_writes_debug_report(tmp_path: Path) -> None:
+    """Run crop inference and reporting without replacing source images."""
+    source_path = tmp_path / "book.png"
+    Image.new("RGB", (100, 100), "white").save(source_path)
+    original_bytes = source_path.read_bytes()
+
+    entries = transform.transform_images(
+        tmp_path,
+        client_adapter=MockTransformClientAdapter(),
+        verbose=0,
+        dry_run=True,
+    )
+
+    assert source_path.read_bytes() == original_bytes
+    assert entries[0].status == "Would transform"
+    assert (tmp_path / transform.TRANSFORM_REVIEW_FILENAME).is_file()
+
+
+def test_transform_images_skips_full_image_crop(tmp_path: Path) -> None:
+    """Avoid resampling an image when the VLM returns its full frame."""
+    source_path = tmp_path / "book.png"
+    Image.new("RGB", (100, 100), "white").save(source_path)
+    original_bytes = source_path.read_bytes()
+    client = MockTransformClientAdapter(
+        [[0, 0], [1, 0], [1, 1], [0, 1]],
+    )
+
+    entries = transform.transform_images(
+        tmp_path,
+        client_adapter=client,
+        verbose=0,
+    )
+
+    assert source_path.read_bytes() == original_bytes
+    assert entries[0].status == "No transform needed"
+
+
+def test_transform_images_preserves_source_when_trash_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the original and remove the staged crop when trash is unavailable."""
+    source_path = tmp_path / "book.png"
+    Image.new("RGB", (100, 100), "white").save(source_path)
+    original_bytes = source_path.read_bytes()
+
+    def unavailable_trash(path: Path) -> None:
+        raise TrashPermissionError(path)
+
+    monkeypatch.setattr(transform, "send2trash", unavailable_trash)
+
+    entries = transform.transform_images(
+        tmp_path,
+        client_adapter=MockTransformClientAdapter(),
+        verbose=0,
+    )
+
+    assert source_path.read_bytes() == original_bytes
+    assert entries[0].status == "Write failed"
+    assert list(tmp_path.glob(".*.crop-*")) == []
+
+
+def test_crop_cli_previews_dry_run_report_unless_disabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_cli: Callable[..., str],
+) -> None:
+    """Open the dry-run debug report unless --no-preview is set."""
+    uploads_dir = tmp_path / "uploads"
+    uploads_dir.mkdir()
+    calls: list[dict[str, object]] = []
+    previewed: list[Path] = []
+
+    def fake_transform_images(directory: Path, **kwargs: object) -> list[object]:
+        calls.append({"directory": directory, **kwargs})
+        (directory / transform.TRANSFORM_REVIEW_FILENAME).write_text("report")
+        return []
+
+    monkeypatch.setattr(transform, "transform_images", fake_transform_images)
+    monkeypatch.setattr(cli, "preview", previewed.append)
+
+    run_cli("crop", str(uploads_dir), "--provider", "qwen", "--dry-run", "-v")
+    run_cli("crop", str(uploads_dir), "--dry-run", "--no-preview")
+
+    assert calls[0] == {
+        "directory": uploads_dir,
+        "provider": it.VisionModelProvider.QWEN,
+        "verbose": 2,
+        "dry_run": True,
+    }
+    assert previewed == [uploads_dir / transform.TRANSFORM_REVIEW_FILENAME]
 
 
 def test_perspective_crop_uses_background_hint_outside_source() -> None:
@@ -322,6 +419,196 @@ def test_perspective_crop_uses_background_hint_outside_source() -> None:
 
     assert crop is not None
     assert crop.getpixel((0, 0)) == (12, 34, 56)
+
+
+def test_hough_corner_detection_accepts_flat_line_array(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accept OpenCV builds that return Hough lines with shape N by 4."""
+    lines = np.asarray(
+        [
+            [10, 10, 90, 10],
+            [10, 90, 90, 90],
+            [10, 10, 10, 90],
+            [90, 10, 90, 90],
+        ],
+        dtype=np.int32,
+    )
+    monkeypatch.setattr(transform.cv2, "HoughLinesP", lambda *args, **kwargs: lines)
+
+    corners = transform._detect_line_corners(np.zeros((100, 100, 3), dtype=np.uint8))
+
+    assert corners is not None
+    np.testing.assert_array_equal(
+        corners,
+        np.asarray([[10, 10], [90, 10], [90, 90], [10, 90]], dtype=np.float32),
+    )
+
+
+def test_contour_detection_uses_color_when_grayscale_contrast_is_absent() -> None:
+    """Detect a colored boundary whose foreground and background have equal luminance."""
+    image = np.full((200, 200, 3), (0, 0, 255), dtype=np.uint8)
+    image[40:160, 50:150] = (0, 130, 0)
+    background = transform.BackgroundHint(
+        color_rgb=[255, 0, 0],
+        confidence=1,
+        uniformity="uniform",
+    )
+
+    corners = transform._detect_contour_corners(image, background)
+
+    assert corners is not None
+    np.testing.assert_allclose(
+        corners,
+        np.asarray([[50, 40], [149, 40], [149, 159], [50, 159]], dtype=np.float32),
+        atol=2,
+    )
+
+
+def test_interactive_contour_detection_uses_inferred_background(tmp_path: Path) -> None:
+    """Pass the measured border background to interactive contour detection."""
+    image = np.full((200, 200, 3), (255, 0, 0), dtype=np.uint8)
+    image[40:160, 50:150] = (0, 130, 0)
+    image_filename = tmp_path / "colored-background.png"
+    Image.fromarray(image).save(image_filename)
+
+    _, points, background = review_app.detect_clip_corners(image_filename, "contour")
+
+    assert background == "#ff0000"
+    np.testing.assert_allclose(
+        points,
+        np.asarray([[50, 40], [149, 40], [149, 159], [50, 159]], dtype=np.float32),
+        atol=2,
+    )
+
+
+def test_detectors_suppress_fine_textured_background() -> None:
+    """Keep dense background texture from obscuring a broad closed boundary."""
+    rows, columns = np.indices((240, 240))
+    texture = (((rows // 2 + columns // 2) % 2) * 70 + 40).astype(np.uint8)
+    image = np.stack(
+        [texture, np.roll(texture, 1, axis=0), np.roll(texture, 1, axis=1)],
+        axis=2,
+    )
+    image[50:190, 60:180] = (220, 220, 220)
+    background = transform.BackgroundHint(
+        color_rgb=[75, 75, 75],
+        confidence=0.2,
+        uniformity="varied",
+    )
+    expected = np.asarray([[60, 50], [179, 50], [179, 189], [60, 189]], dtype=np.float32)
+
+    for corners in (
+        transform._detect_contour_corners(image, background),
+        transform._detect_line_corners(image, background),
+    ):
+        assert corners is not None
+        np.testing.assert_allclose(corners, expected, atol=2)
+
+
+def test_interactive_vlm_adjudicates_cv_guesses(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Ask the configured VLM to refine normalized contour and Hough guesses."""
+    image_filename = tmp_path / "sample.png"
+    Image.new("RGB", (100, 100), "red").save(image_filename)
+    calls: list[tuple[str | list[str], str, type[BaseModel]]] = []
+    providers: list[it.VisionModelProvider] = []
+
+    class SinglePassClient(MockVisionModelClientAdapter):
+        def vision_task(
+            self,
+            image_base64: str | list[str],
+            prompt: str,
+            response_format: type[BaseModel],
+        ) -> it.VisionTaskResult:
+            calls.append((image_base64, prompt, response_format))
+            return it.VisionTaskResult(
+                data=transform.CropVlmDecision(
+                    which="contour",
+                    adjustments="Inset each edge slightly.",
+                    points=[
+                        [-0.2, 0.3],
+                        [0.95, 0.05],
+                        [0.95, 0.95],
+                        [0.05, 0.95],
+                    ],
+                ),
+                model=self.model,
+                total_tokens=1,
+            )
+
+    client = SinglePassClient()
+    monkeypatch.setattr(
+        it,
+        "get_vision_model_client_adapter",
+        lambda provider: providers.append(provider) or client,
+    )
+
+    size, points, background = review_app.detect_clip_corners(
+        image_filename,
+        "llm",
+        provider=it.VisionModelProvider.QWEN,
+        verbose=2,
+    )
+
+    assert size == (100, 100)
+    np.testing.assert_allclose(
+        points,
+        [[-19.8, 29.7], [94.05, 4.95], [94.05, 94.05], [4.95, 94.05]],
+    )
+    assert background == "#ff0000"
+    assert providers == [it.VisionModelProvider.QWEN]
+    assert len(calls) == 1
+    images, prompt, response_format = calls[0]
+    assert isinstance(images, list) and len(images) == 3
+    assert "Image 1: original" in prompt
+    assert "Image 2: contour guess overlay" in prompt
+    assert "Image 3: Hough guess overlay" in prompt
+    assert '"contour"' in prompt
+    assert '"hough"' in prompt
+    assert "0 to 1 is the range" in prompt
+    assert "(-0.2, 0.3) is perfectly valid" in prompt
+    assert "coordinates [[0, 0], [1, 0], [1, 1], [0, 1]]" in prompt
+    assert response_format is transform.CropVlmDecision
+    assert capsys.readouterr().out == (
+        "VLM selected contour.\n"
+        "VLM adjustments: Inset each edge slightly.\n"
+    )
+
+
+def test_interactive_rectangle_crop_resizes_image(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Crop axis-aligned bounds and resize through the review tool."""
+    image_filename = tmp_path / "sample.png"
+    Image.new("RGB", (100, 80), "red").save(image_filename)
+    trashed_paths: list[Path] = []
+
+    def fake_send2trash(path: Path) -> None:
+        trashed_paths.append(path)
+        path.unlink()
+
+    monkeypatch.setattr(review_app, "send2trash", fake_send2trash)
+
+    review_app.apply_clip(
+        image_filename,
+        review_app.ClipRequest(
+            points=[(10, 20), (60, 20), (60, 70), (10, 70)],
+            background="#ffffff",
+            mode="rectangle",
+            output_width=25,
+            output_height=30,
+            resampling="lanczos",
+        ),
+    )
+
+    assert trashed_paths == [image_filename]
+    with Image.open(image_filename) as cropped:
+        assert cropped.size == (25, 30)
 
 
 def test_embed_image_paths_reuses_cached_vectors_for_unchanged_images(
@@ -1285,6 +1572,7 @@ def test_review_app_updates_one_based_metadata_row(
                 "filename_already_makes_sense": "True",
                 "tags": "art;mock",
                 "description": "Original description.",
+                    it.REVIEW_ID_COLUMN: "1",
             }
         )
 
@@ -1301,17 +1589,151 @@ def test_review_app_updates_one_based_metadata_row(
     assert "Metadata:" not in response.text
     assert "Rows:" not in response.text
     assert "Delete" in response.text
+    assert "Crop" in response.text
+    assert 'data-crop-row="1"' in response.text
+    assert 'class="img-fluid crop-trigger" data-crop-row="1"' in response.text
+    assert 'class="review-actions" role="group" aria-label="Review actions"' in response.text
+    assert 'hx-post="/row/1/shelve"' in response.text
+    assert 'id="crop-modal"' in response.text
+    assert 'id="crop-source-canvas"' in response.text
+    assert 'id="crop-preview-canvas"' in response.text
+    assert 'data-crop-mode="rectangle" aria-pressed="true"' in response.text
+    assert 'data-crop-mode="perspective" aria-pressed="false"' in response.text
+    assert 'id="rectangle-tools"' in response.text
+    assert 'id="crop-output-width"' in response.text
+    assert 'id="crop-output-height"' in response.text
+    assert 'id="crop-downsampling"' in response.text
+    assert 'value="0.8" data-ratio data-label="80%"' in response.text
+    assert 'value="0.33333333333" data-ratio data-label="33%"' in response.text
+    assert "option.textContent = `${option.dataset.label} - (${width}x${height})`;" in response.text
+    assert 'id="crop-result-size"' in response.text
+    assert 'arrowup: [0, -1]' in response.text
+    assert 'arrowright: [1, 0]' in response.text
+    assert 'id="crop-canvas-background"' in response.text
+    assert 'aria-label="Canvas background: gray"' in response.text
+    assert "const canvasBackgrounds = [" in response.text
+    assert "state.canvasBackgroundIndex = 2;" in response.text
+    assert "state.mode === 'perspective'" in response.text
+    assert 'id="crop-aspect-lock"' not in response.text
+    assert 'id="crop-resampling"' not in response.text
+    assert 'id="crop-cancel"' in response.text
+    assert 'type="color" value="#ffffff"' in response.text
+    assert 'data-crop-detector="hough"' in response.text
+    assert 'data-crop-detector="contour"' in response.text
+    assert 'data-crop-detector="llm" aria-pressed="false">VLM</button>' in response.text
+    assert "algorithm === 'contour' || algorithm === 'llm'" in response.text
+    assert "'Asking the VLM...'" in response.text
+    assert "'Asking the LLM...'" not in response.text
+    assert response.text.count('data-crop-detector="full"') == 2
+    assert 'data-crop-detector="hough" aria-pressed="false"' in response.text
+    assert 'clip?algorithm=full' not in response.text
     assert "Rename" not in response.text
     assert '<span class="filename-mismatch">' not in response.text
     assert 'Original Filename' in response.text
+    assert "art\nmock" in response.text
+    assert "One tag per line." in response.text
+    assert response.text.count('class="form-control" data-auto-save') == 2
     assert 'readonly' in response.text
     assert "No images to review." in response.text
     assert '<p id="empty-review-message" class="alert alert-info" role="status" hidden>' in response.text
     assert '<div id="shelve-controls" class="mb-4 d-flex align-items-start" hidden>' in response.text
+    assert 'data-image-width="8" data-image-height="8"' in response.text
+    assert '<span class="image-dimensions"><span>8</span>x<span>8</span></span>' in response.text
+
+    first_image_src = re.search(r'src="(/images/sample\.jpg\?v=\d+)"', response.text)
+    assert first_image_src is not None
+    refreshed_response = client.get("/")
+    refreshed_image_src = re.search(
+        r'src="(/images/sample\.jpg\?v=\d+)"',
+        refreshed_response.text,
+    )
+    assert refreshed_image_src is not None
+    assert refreshed_image_src.group(1) != first_image_src.group(1)
+
+    response = client.get("/images/sample.jpg")
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store, max-age=0"
+    assert response.headers["pragma"] == "no-cache"
+
+    response = client.get("/row/1/clip")
+    assert response.status_code == 200
+    clip_details = response.json()
+    assert clip_details["background"].startswith("#")
+    assert {key: value for key, value in clip_details.items() if key != "background"} == {
+        "width": 8,
+        "height": 8,
+        "points": [[0.0, 0.0], [7.0, 0.0], [7.0, 7.0], [0.0, 7.0]],
+    }
+
+    original_image_bytes = image_filename.read_bytes()
+    detected_algorithms: list[str] = []
+    original_detect_clip_corners = review_app.detect_clip_corners
+
+    def fake_detect_clip_corners(
+        image_path: Path,
+        algorithm: str = "hough",
+        **kwargs: object,
+    ) -> tuple[tuple[int, int], list[list[float]], str | None]:
+        assert image_path == image_filename
+        assert kwargs == {
+            "provider": it.VisionModelProvider.OPENAI,
+            "verbose": 1,
+        }
+        detected_algorithms.append(algorithm)
+        return (8, 8), [[1, 1], [6, 1], [6, 6], [1, 6]], None
+
+    monkeypatch.setattr(review_app, "detect_clip_corners", fake_detect_clip_corners)
+    response = client.get("/row/1/clip?algorithm=contour")
+    assert response.status_code == 200
+    assert response.json()["points"] == [[1, 1], [6, 1], [6, 6], [1, 6]]
+    assert detected_algorithms == ["contour"]
+    assert image_filename.read_bytes() == original_image_bytes
+    monkeypatch.setattr(review_app, "detect_clip_corners", original_detect_clip_corners)
+
+    def fail_detection(
+        image_path: Path,
+        algorithm: str = "hough",
+        **kwargs: object,
+    ) -> tuple[tuple[int, int], list[list[float]], str | None]:
+        raise RuntimeError("model unavailable")
+
+    monkeypatch.setattr(review_app, "detect_clip_corners", fail_detection)
+    response = client.get("/row/1/clip?algorithm=llm")
+    assert response.status_code == 502
+    assert response.json() == {"detail": "VLM detection failed: model unavailable"}
+    monkeypatch.setattr(review_app, "detect_clip_corners", original_detect_clip_corners)
+
+    trashed_paths: list[Path] = []
+
+    def fake_send2trash(path: Path) -> None:
+        trashed_paths.append(path)
+        path.unlink()
+
+    monkeypatch.setattr(review_app, "send2trash", fake_send2trash)
+    response = client.post(
+        "/row/1/clip",
+        json={
+            "points": [[0, 0], [7, 0], [7, 7], [0, 7]],
+            "background": "#123456",
+        },
+    )
+    assert response.status_code == 200
+    assert response.json() == {
+        "image_src": "/images/sample.jpg",
+        "width": 7,
+        "height": 7,
+    }
+    assert trashed_paths == [image_filename]
+    assert image_filename.is_file()
 
     response = client.delete("/row/1")
     assert response.status_code == 200
-    assert response.text == ""
+    assert response.text == (
+        '<div class="alert alert-secondary delete-item-result" role="status">'
+        "Deleted sample.jpg."
+        "</div>"
+    )
+    assert '<form id="row-' not in response.text
     assert not image_filename.exists()
 
     with metadata_filename.open(newline="", encoding="utf-8") as metadata_file:
@@ -1346,6 +1768,7 @@ def test_review_app_updates_one_based_metadata_row(
                 "filename_already_makes_sense": "True",
                 "tags": "art;mock",
                 "description": "Original description.",
+                    it.REVIEW_ID_COLUMN: "1",
             }
         )
 
@@ -1354,7 +1777,7 @@ def test_review_app_updates_one_based_metadata_row(
     assert "Shelve" in response.text
     assert "Rename" in response.text
     assert '<span class="filename-mismatch">sample.jpg</span>' in response.text
-    assert 'src="/images/sample.jpg"' in response.text
+    assert 'src="/images/sample.jpg?v=' in response.text
     assert 'data-accept-filename="sample.jpg"' in response.text
     assert 'aria-label="Use current filename as clean filename"' in response.text
     assert 'name="clean_filename" class="form-control"' in response.text
@@ -1373,7 +1796,7 @@ def test_review_app_updates_one_based_metadata_row(
     assert "Saved." in response.text
     assert "memes" in response.text
     assert "better_name2.jpg" in response.text
-    assert 'src="/images/better_name2.jpg"' in response.text
+    assert 'src="/images/better_name2.jpg?v=' in response.text
 
     with metadata_filename.open(newline="", encoding="utf-8") as metadata_file:
         updated_row = next(csv.DictReader(metadata_file))
@@ -1422,6 +1845,28 @@ def test_review_app_updates_one_based_metadata_row(
     assert response.status_code == 500
     assert response.text == "Could not save: The metadata file is locked."
 
+    original_shelve_images = it.shelve_images
+    shelved_review_ids: list[set[str] | None] = []
+    shelve_prune_verbosity: list[int | None] = []
+
+    def fake_shelve_images(*args: object, **kwargs: object) -> None:
+        shelved_review_ids.append(cast("set[str] | None", kwargs.get("review_ids")))
+        shelve_prune_verbosity.append(cast("int | None", kwargs.get("prune_verbose")))
+        print("moving uploads/final_name.jpg to memes/final_name.jpg ...success!")
+
+    monkeypatch.setattr(it, "shelve_images", fake_shelve_images)
+    response = client.post("/row/1/shelve")
+    assert response.status_code == 200
+    assert response.text == (
+        '<div class="alert alert-success shelve-item-result" role="status">'
+        "moving uploads/final_name.jpg to memes/final_name.jpg ...success!"
+        "</div>"
+    )
+    assert '<form id="row-' not in response.text
+    assert shelved_review_ids == [{"1"}]
+    assert shelve_prune_verbosity == [0]
+    monkeypatch.setattr(it, "shelve_images", original_shelve_images)
+
     response = client.post("/shelve")
     assert response.status_code == 200
     assert "moving uploads/final_name.jpg to memes/final_name.jpg ...success!" in response.text
@@ -1429,6 +1874,73 @@ def test_review_app_updates_one_based_metadata_row(
     assert response.text.endswith('hx-swap-oob="innerHTML"></div>')
     assert not (uploads_dir / "final_name.jpg").exists()
     assert (tmp_path / "memes" / "final_name.jpg").exists()
+
+
+def test_review_uuid_survives_earlier_row_pruning(tmp_path: Path) -> None:
+    """Save the intended stale card after an earlier metadata row is removed."""
+    uploads_dir = tmp_path / "uploads"
+    uploads_dir.mkdir()
+    first_image = uploads_dir / "first.jpg"
+    second_image = uploads_dir / "second.jpg"
+    Image.new("RGB", (8, 8), "red").save(first_image)
+    Image.new("RGB", (8, 8), "blue").save(second_image)
+    metadata_filename = uploads_dir / "image_metadata.csv"
+    review_app.ensure_review_metadata(
+        metadata_filename,
+        review_app.review_directory_images(uploads_dir),
+    )
+    review_app.set_review_metadata(
+        metadata_filename,
+        write_test_stackmap(uploads_dir),
+    )
+    items = review_app.review_items(metadata_filename)
+    second_review_id = items[1]["row_id"]
+    assert second_review_id != "2"
+
+    first_image.unlink()
+    assert it.prune_metadata_rows(metadata_filename, verbose=0) == 1
+
+    response = TestClient(review_app.app).post(
+        f"/row/{second_review_id}",
+        data={
+            "category": "art",
+            "genre": "comedy",
+            "clean_filename": "second.jpg",
+            "tags": "second-only",
+            "description": "Still belongs to the blue image.",
+        },
+    )
+
+    assert response.status_code == 200
+    metadata_df = pd.read_csv(metadata_filename, keep_default_na=False)
+    assert len(metadata_df) == 1
+    assert metadata_df.at[0, review_app.REVIEW_ID_COLUMN] == second_review_id
+    assert metadata_df.at[0, "original_filename"] == "second.jpg"
+    assert metadata_df.at[0, "tags"] == "second-only"
+    assert metadata_df.at[0, "description"] == "Still belongs to the blue image."
+
+
+def test_ensure_metadata_review_ids_migrates_once(tmp_path: Path) -> None:
+    """Persist UUID7 values immediately and no-op after migration."""
+    metadata_filename = tmp_path / "image_metadata.csv"
+    legacy_columns = [
+        column for column in it.csv_columns if column != it.REVIEW_ID_COLUMN
+    ]
+    with metadata_filename.open("w", newline="", encoding="utf-8") as metadata_file:
+        writer = csv.DictWriter(metadata_file, fieldnames=legacy_columns)
+        writer.writeheader()
+        writer.writerow({"status": "ok", "original_filename": "first.jpg"})
+        writer.writerow({"status": "ok", "original_filename": "second.jpg"})
+
+    assert it.ensure_metadata_review_ids(metadata_filename)
+    migrated_bytes = metadata_filename.read_bytes()
+    metadata_df = pd.read_csv(metadata_filename, keep_default_na=False)
+    review_ids = metadata_df[it.REVIEW_ID_COLUMN].tolist()
+    assert len(set(review_ids)) == 2
+    assert all(uuid.UUID(review_id).version == 7 for review_id in review_ids)
+
+    assert not it.ensure_metadata_review_ids(metadata_filename)
+    assert metadata_filename.read_bytes() == migrated_bytes
 
 
 def test_review_app_categories_follow_configured_stackmap(
@@ -1660,6 +2172,7 @@ def test_review_metadata_cleans_backup_on_keyboard_interrupt(
     )
     backup_filename = metadata_filename.with_suffix(".csv.bak")
     backup_filename.write_text("backup", encoding="utf-8")
+    Image.new("RGB", (8, 8), "red").save(tmp_path / "sample.jpg")
 
     monkeypatch.setattr(review_app.webbrowser, "open", lambda *args, **kwargs: None)
 
@@ -1679,18 +2192,105 @@ def test_review_metadata_cleans_backup_on_keyboard_interrupt(
     assert not backup_filename.exists()
 
 
-def test_review_cli_exits_if_metadata_is_missing(
+def test_review_cli_exits_if_directory_has_no_images(
     tmp_path: Path,
     run_cli: Callable[..., str],
 ) -> None:
-    """Require metadata before starting the review app."""
+    """Exit with a message instead of opening an empty review app."""
     uploads_dir = tmp_path / "uploads"
     uploads_dir.mkdir()
 
-    with pytest.raises(SystemExit) as exc_info:
-        run_cli("review", str(uploads_dir))
+    output = run_cli("review", str(uploads_dir))
 
-    assert exc_info.value.code == f"metadata file not found: {uploads_dir / 'image_metadata.csv'}"
+    assert output == f"No images found in {uploads_dir}.\n"
+    assert not (uploads_dir / "image_metadata.csv").exists()
+
+
+def test_review_cli_passes_provider_and_verbose(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_cli: Callable[..., str],
+) -> None:
+    """Pass review VLM configuration into the server."""
+    uploads_dir = tmp_path / "uploads"
+    uploads_dir.mkdir()
+    Image.new("RGB", (8, 8), "red").save(uploads_dir / "sample.jpg")
+    calls: list[dict[str, object]] = []
+
+    def fake_review_metadata(metadata_filename: Path, **kwargs: object) -> None:
+        calls.append({"metadata_filename": metadata_filename, **kwargs})
+
+    monkeypatch.setattr(review_app, "review_metadata", fake_review_metadata)
+
+    run_cli("review", str(uploads_dir), "--provider", "qwen", "-v")
+
+    assert calls == [
+        {
+            "metadata_filename": uploads_dir / "image_metadata.csv",
+            "stackmap": write_test_stackmap(uploads_dir),
+            "provider": "qwen",
+            "verbose": 2,
+        }
+    ]
+
+
+def test_review_metadata_creates_blank_rows_for_all_directory_images(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Open review without metadata and show every allowed image with blank fields."""
+    uploads_dir = tmp_path / "uploads"
+    uploads_dir.mkdir()
+    first_image = uploads_dir / "first.jpg"
+    oversized_image = uploads_dir / "oversized.jpg"
+    second_image = uploads_dir / "second.png"
+    ignored_image = uploads_dir / "ignored.webp"
+    Image.new("RGB", (8, 8), "red").save(first_image)
+    Image.new("RGB", (2001, 3), "yellow").save(oversized_image)
+    Image.new("RGB", (9, 7), "blue").save(second_image)
+    Image.new("RGB", (6, 6), "green").save(ignored_image)
+    metadata_filename = uploads_dir / "image_metadata.csv"
+    opened_urls: list[str] = []
+    monkeypatch.setattr(review_app.webbrowser, "open", opened_urls.append)
+
+    import uvicorn
+
+    def fake_run(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+
+    with pytest.raises(KeyboardInterrupt):
+        review_app.review_metadata(
+            metadata_filename,
+            stackmap=write_test_stackmap(uploads_dir),
+        )
+
+    assert len(opened_urls) == 1
+    assert opened_urls[0].startswith("http://127.0.0.1:")
+    metadata_df = pd.read_csv(metadata_filename, keep_default_na=False)
+    assert metadata_df["original_filename"].tolist() == [
+        "first.jpg",
+        "oversized.jpg",
+        "second.png",
+    ]
+    assert metadata_df["status"].tolist() == ["ok", "ok", "ok"]
+    assert metadata_df["category"].tolist() == ["", "", ""]
+    assert metadata_df["genre"].tolist() == ["", "", ""]
+    assert metadata_df["clean_filename"].tolist() == ["", "", ""]
+    assert metadata_df["tags"].tolist() == ["", "", ""]
+    assert metadata_df["description"].tolist() == ["", "", ""]
+
+    response = TestClient(review_app.app).get("/")
+    assert response.status_code == 200
+    assert "first.jpg" in response.text
+    assert "oversized.jpg" in response.text
+    assert "second.png" in response.text
+    assert "ignored.webp" not in response.text
+    assert response.text.count('class="gallery-image row mb-4"') == 3
+    assert response.text.count('name="clean_filename" class="form-control" value=""') == 3
+    assert response.text.count('<option value="" selected></option>') == 6
+    assert '<span class="image-dimensions"><span class="filename-mismatch">2001</span>x<span>3</span></span>' in response.text
 
 
 def test_gallery_cli_defaults_output_to_selected_directory(
