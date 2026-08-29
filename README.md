@@ -87,10 +87,10 @@ techniques (Hough transforms and largest-quadrilateral contour detection) and a 
 
 `just review` pulls up an interactive HTMX app to review and correct the
 inferred tags and filenames. It provides an interactive crop tool that can
-crop, resize, and apply perspective transforms to images. The crop tool
-can use the same vision models as the `just clip` pipeline.
-The review tool also allows you to shelve or delete images during the review process
-([example](https://olooney.github.io/image-tagger/docs/example/review_screenshot.png)).
+crop, resize, and either automatically or manually apply perspective transforms to images.
+([example](https://olooney.github.io/image-tagger/docs/crop_tool_screenshot.png)).
+ The review tool also allows you to shelve or delete images during the review process
+([example](https://olooney.github.io/image-tagger/docs/review_screenshot.png)).
 
 `just shelve` moves images into separate directories based on their inferred
 (and human-reviewed) categories.
@@ -116,7 +116,7 @@ image and its inferred metadata side-by-side
 dedupe work, filename cleanup gaps, and the largest images in `DIRECTORY`.
 It shows images larger than 1 MB by default; use `--large-image-threshold` with
 values such as `500k` or `2 MB` to change that limit.
-([example](https://olooney.github.io/image-tagger/docs/example/report_screenshot.png)).
+([example](https://olooney.github.io/image-tagger/docs/report_screenshot.png)).
 
 Vision Models
 -------------
