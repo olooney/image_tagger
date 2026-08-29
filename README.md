@@ -78,7 +78,7 @@ paths. For example, `just dedupe books` uses the configured `books` shelf, and
 `just tag` applies a vision language model (VLM) to tag and categorize images
 in a structured dataset. It also determines a clean filename for each image
 according to internal naming conventions. Multiple model providers are supported
-([example](https://olooney.github.io/image-tagger/docs/example/image_metadata.csv)).
+([Download example CSV](https://olooney.github.io/image-tagger/docs/example/image_metadata.csv)).
 
 `just clip` automatically applies a perspective transform to orthorectify (unskew) images.
 It determines the correct transform using a combination of traditional computer vision
