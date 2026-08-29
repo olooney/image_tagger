@@ -116,6 +116,7 @@ image and its inferred metadata side-by-side
 dedupe work, filename cleanup gaps, and the largest images in `DIRECTORY`.
 It shows images larger than 1 MB by default; use `--large-image-threshold` with
 values such as `500k` or `2 MB` to change that limit.
+([example](https://olooney.github.io/image-tagger/example/report_screenshot.png)).
 
 Vision Models
 -------------
