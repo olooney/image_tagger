@@ -78,19 +78,19 @@ paths. For example, `just dedupe books` uses the configured `books` shelf, and
 `just tag` applies a vision language model (VLM) to tag and categorize images
 in a structured dataset. It also determines a clean filename for each image
 according to internal naming conventions. Multiple model providers are supported
-([example](https://olooney.github.io/image-tagger/example/image_metadata.csv)).
+([example](https://olooney.github.io/image-tagger/docs/example/image_metadata.csv)).
 
 `just clip` automatically applies a perspective transform to orthorectify (unskew) images.
 It determines the correct transform using a combination of traditional computer vision
 techniques (Hough transforms and largest-quadrilateral contour detection) and a VLM
-([example](https://olooney.github.io/image-tagger/example/transform_review.html)).
+([example](https://olooney.github.io/image-tagger/docs/example/transform_review.html)).
 
 `just review` pulls up an interactive HTMX app to review and correct the
 inferred tags and filenames. It provides an interactive crop tool that can
 crop, resize, and apply perspective transforms to images. The crop tool
 can use the same vision models as the `just clip` pipeline.
 The review tool also allows you to shelve or delete images during the review process
-([example](https://olooney.github.io/image-tagger/example/review_screenshot.png)).
+([example](https://olooney.github.io/image-tagger/docs/example/review_screenshot.png)).
 
 `just shelve` moves images into separate directories based on their inferred
 (and human-reviewed) categories.
@@ -100,23 +100,23 @@ above `--automatic-threshold` are removed automatically; scores at or above
 `--llm-threshold` are confirmed by the selected vision model before removal.
 It maintains a cache of already compared images to avoid doing the full $O(n^2)$
 comparison each time
-([example](https://olooney.github.io/image-tagger/example/dedupe_review.html)).
+([example](https://olooney.github.io/image-tagger/docs/example/dedupe_review.html)).
 
 `just wall` creates an `index.html` image wall directly from every supported image
 under `DIRECTORY`. It uses relative image paths, computes a median image aspect
 ratio up front, and displays the images in equal-sized grid cells with a
 click-to-open full-size overlay
-([example](https://olooney.github.io/image-tagger/example/wall.html)).
+([example](https://olooney.github.io/image-tagger/docs/example/wall.html)).
 
 `just gallery` produces a static HTML version of the review tool showing the
 image and its inferred metadata side-by-side
-([example](https://olooney.github.io/image-tagger/example/gallery.html)).
+([example](https://olooney.github.io/image-tagger/docs/example/gallery.html)).
 
 `just report` prints image totals, metadata breakdowns, outstanding metadata and
 dedupe work, filename cleanup gaps, and the largest images in `DIRECTORY`.
 It shows images larger than 1 MB by default; use `--large-image-threshold` with
 values such as `500k` or `2 MB` to change that limit.
-([example](https://olooney.github.io/image-tagger/example/report_screenshot.png)).
+([example](https://olooney.github.io/image-tagger/docs/example/report_screenshot.png)).
 
 Vision Models
 -------------
