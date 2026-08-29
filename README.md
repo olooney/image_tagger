@@ -1,6 +1,8 @@
 Image Tagger
 ============
 
+![Image Tagger Lead](docs/lead.png)
+
 A command-line utility that uses vision models to organize images.
 
 Features
