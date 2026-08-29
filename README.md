@@ -41,10 +41,10 @@ The upload workflow is available through `just` tasks. TO preprocess,
 tag, and do human-in-the-loop review of new images, do:
 
 ```bash
-just convert [DIRECTORY]
-just tag [DIRECTORY]
-just rename [DIRECTORY]
-just review [DIRECTORY]
+just convert [DIRECTORY]  # normalize image extensions and metadata
+just tag [DIRECTORY]      # Have a VLM infer tags, categories, clean filenames, etc.
+just rename [DIRECTORY]   # renamed image files to VLM-inferred filenames
+just review [DIRECTORY]   # open interactive HTMX review app
 ```
 
 Or just run this command to do all four in sequence:
@@ -56,13 +56,13 @@ just run [DIRECTORY]
 Next, you can run these individually as needed:
 
 ```bash
-just clip [DIRECTORY]    # automatically detect and fix perspective skew
-just shelve [DIRECTORY]  # distribute files across configured directories
-just dedupe [DIRECTORY]  # identify and automatically remove duplicates
-just wall [DIRECTORY]    # generate a mood-board-style image wall
-just gallery [DIRECTORY] # show images and details side-by-side
-just report [DIRECTORY]  # summary statistics and problems
-just prune [DIRECTORY]   # clean up meta data
+just clip [DIRECTORY]     # automatically detect and fix perspective skew
+just shelve [DIRECTORY]   # distribute files across configured directories
+just dedupe [DIRECTORY]   # identify and automatically remove duplicates
+just wall [DIRECTORY]     # generate a mood-board-style image wall
+just gallery [DIRECTORY]  # show images and details side-by-side
+just report [DIRECTORY]   # summary statistics and problems
+just prune [DIRECTORY]    # clean up meta data
 ```
 
 For detailed CLI instructions, run `just` without any arguments to get a
