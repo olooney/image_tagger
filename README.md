@@ -8,17 +8,27 @@ A command-line utility that uses vision models to organize images.
 Features
 --------
 
-Extract image metadata using a vision model, including categories, genres, tags, and
+* Extract image metadata using a vision model, including categories, genres, tags, and
 image descriptions.
 
-Rename arbitrary image filenames to clean, human-readable filenames.
+* Rename arbitrary image filenames to clean, human-readable filenames.
 
-Normalize uploaded image formats by correcting mismatched extensions and converting
+* Normalize uploaded image formats by correcting mismatched extensions and converting
 lossless or uncompressed formats to PNG and lossy formats to JPEG.
 
-Prepare a static HTML gallery of images and metadata.
+* Detect and remove duplicate images using CLIP similarity and optional vision-model
+adjudication.
 
-Move tagged images into configured library shelf directories.
+* Automatically correct perspective distortion using computer vision and vision models.
+
+* Review and manually edit inferred metadata, filenames, crops, and perspective transforms in an
+interactive web app.
+
+* Prepare a static HTML gallery of images and metadata.
+
+* Generate a searchable image wall with a full-size image viewer.
+
+* Organize tagged images into configurable directories.
 
 
 CLI Usage
@@ -27,20 +37,45 @@ CLI Usage
 You will need to put your OpenAI API key in the usual `OPENAI_API_KEY`
 environment variable.
 
-The upload workflow is available through `just` tasks:
+The upload workflow is available through `just` tasks. TO preprocess,
+tag, and do human-in-the-loop review of new images, do:
 
 ```bash
 just convert [DIRECTORY]
 just tag [DIRECTORY]
 just rename [DIRECTORY]
-just clip [DIRECTORY]
 just review [DIRECTORY]
-just shelve [DIRECTORY]
-just dedupe [DIRECTORY]
-just wall [DIRECTORY]
-just gallery [DIRECTORY]
-just report [DIRECTORY]
 ```
+
+Or just run this command to do all four in sequence:
+
+```bash
+just run [DIRECTORY]
+```
+
+Next, you can run these individually as needed:
+
+```bash
+just clip [DIRECTORY]    # automatically detect and fix perspective skew
+just shelve [DIRECTORY]  # distribute files across configured directories
+just dedupe [DIRECTORY]  # identify and automatically remove duplicates
+just wall [DIRECTORY]    # generate a mood-board-style image wall
+just gallery [DIRECTORY] # show images and details side-by-side
+just report [DIRECTORY]  # summary statistics and problems
+just prune [DIRECTORY]   # clean up meta data
+```
+
+For detailed CLI instructions, run `just` without any arguments to get a
+list of justfile tasks, then use `--help` to see the
+full list of CLI arguments and options for a given command:
+
+```bash
+just COMMAND --help
+```
+
+
+Command Details
+---------------
 
 `just convert` prepares uploads for tagging. It corrects image extensions when
 the file contents do not match the name, converts lossless or uncompressed
@@ -86,11 +121,15 @@ techniques (Hough transforms and largest-quadrilateral contour detection) and a 
 ([example](https://olooney.github.io/image-tagger/docs/example/transform_review.html)).
 
 `just review` pulls up an interactive HTMX app to review and correct the
-inferred tags and filenames. It provides an interactive crop tool that can
-crop, resize, and either automatically or manually apply perspective transforms to images.
-([example](https://olooney.github.io/image-tagger/docs/crop_tool_screenshot.png)).
- The review tool also allows you to shelve or delete images during the review process
-([example](https://olooney.github.io/image-tagger/docs/review_screenshot.png)).
+inferred tags and filenames. The review tool also allows you to shelve or delete
+images during the review process.
+
+![Image review interface](docs/review_screenshot.png)
+
+It also provides an interactive crop tool that can crop, resize, and either
+automatically or manually apply perspective transforms to images.
+
+![Interactive crop and perspective tool](docs/crop_tool_screenshot.png)
 
 `just shelve` moves images into separate directories based on their inferred
 (and human-reviewed) categories.
@@ -116,7 +155,8 @@ image and its inferred metadata side-by-side
 dedupe work, filename cleanup gaps, and the largest images in `DIRECTORY`.
 It shows images larger than 1 MB by default; use `--large-image-threshold` with
 values such as `500k` or `2 MB` to change that limit.
-([example](https://olooney.github.io/image-tagger/docs/report_screenshot.png)).
+
+![Image collection report](docs/report_screenshot.png)
 
 Vision Models
 -------------
