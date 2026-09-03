@@ -117,7 +117,19 @@ def tag_uploads(args: argparse.Namespace) -> None:
         instructions_filename=args.instructions_filename,
         categories=args.stackmap_config.categories,
         category_descriptions=args.stackmap_config.category_descriptions,
+        quad_detector=transform.detect_quad if args.quad else None,
     )
+
+
+def populate_upload_quads(args: argparse.Namespace) -> None:
+    """Populate missing perspective-corner metadata for tagged upload images."""
+    count = it.populate_metadata_quads(
+        args.metadata_filename,
+        quad_detector=transform.detect_quad,
+        provider=args.provider,
+        verbose=args.verbose,
+    )
+    print("number of tagged image files quad calculated:", count)
 
 
 def dedupe_uploads(args: argparse.Namespace) -> None:
@@ -391,7 +403,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tag_parser.add_argument("--instructions-filename", type=path_arg)
     tag_parser.add_argument("--retry-errors", action="store_true")
+    tag_parser.add_argument(
+        "--quad",
+        action="store_true",
+        help="Detect and store normalized perspective-corner coordinates.",
+    )
     tag_parser.set_defaults(func=tag_uploads)
+
+    quad_parser = subparsers.add_parser(
+        "quad",
+        help="Populate missing perspective-corner metadata for tagged images.",
+    )
+    add_common_upload_args(quad_parser)
+    quad_parser.add_argument(
+        "--provider",
+        choices=["openai", "gemma", "qwen"],
+        default="openai",
+    )
+    quad_parser.set_defaults(func=populate_upload_quads)
 
     prune_parser = subparsers.add_parser(
         "prune", help="Remove metadata rows whose image files are missing."
@@ -512,7 +541,7 @@ def main() -> None:
         )
     if args.metadata_filename is None:
         args.metadata_filename = args.directory / METADATA_FILENAME.name
-    if args.command in {"convert", "tag", "prune", "rename", "shelve", "review", "clean"}:
+    if args.command in {"convert", "tag", "quad", "prune", "rename", "shelve", "review", "clean"}:
         it.ensure_metadata_review_ids(args.metadata_filename)
     if args.command == "clean" and args.output_filename is None:
         args.output_filename = args.directory / GALLERY_NAME.name

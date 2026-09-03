@@ -12,7 +12,7 @@ import traceback
 import uuid
 from abc import ABC, abstractmethod
 from collections import Counter
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Hashable, Iterable, Iterator
 from contextlib import contextmanager, redirect_stderr
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -246,6 +246,28 @@ def ensure_metadata_review_ids(metadata_filename: Pathish) -> bool:
     return changed
 
 
+def ensure_metadata_columns(
+    metadata_filename: Pathish,
+    columns: Iterable[str],
+) -> list[str]:
+    """Add missing metadata columns and return the resulting header."""
+    metadata_path = Path(metadata_filename)
+    if not metadata_path.is_file():
+        return [*csv_columns, *[column for column in columns if column not in csv_columns]]
+    try:
+        metadata_df = pd.read_csv(metadata_path, keep_default_na=False)
+    except pd.errors.EmptyDataError:
+        metadata_df = pd.DataFrame(columns=csv_columns)
+    changed = False
+    for column in columns:
+        if column not in metadata_df:
+            metadata_df[column] = ""
+            changed = True
+    if changed:
+        metadata_df.to_csv(metadata_path, index=False)
+    return list(metadata_df.columns)
+
+
 class VisionModelProvider(Enum):
     """Supported vision model providers."""
 
@@ -255,7 +277,7 @@ class VisionModelProvider(Enum):
 
 
 GEMMA_MODEL: str = "gemma4:12b"
-OPENAI_MODEL: str = "gpt-5.6-sol"
+OPENAI_MODEL: str = "gpt-5.6-luna"
 QWEN_MODEL: str = "qwen3.5:4b"
 
 
@@ -1208,6 +1230,7 @@ def tag_images(
     instructions_filename: Pathish | None = None,
     categories: list[str] | None = None,
     category_descriptions: Mapping[str, str] | None = None,
+    quad_detector: Callable[[Path, VisionModelClientAdapter, int], list[list[float]]] | None = None,
 ) -> None:
     """Tag images and write metadata rows."""
     output_path = Path(output_filename)
@@ -1221,10 +1244,14 @@ def tag_images(
         print(f"Using {client_adapter}")
     file_already_exists = output_path.exists()
     mode = "a" if file_already_exists else "w"
+    columns = (
+        ensure_metadata_columns(output_path, ["quad"])
+        if quad_detector is not None
+        else csv_columns
+    )
 
     try:
         with output_path.open(mode, newline="", encoding="utf-8") as csv_file:
-            columns = csv_columns
             writer = csv.DictWriter(csv_file, fieldnames=columns)
             if not file_already_exists:
                 writer.writeheader()
@@ -1246,6 +1273,10 @@ def tag_images(
                     duration = row.pop("vision_duration")
                     vision_durations.append(duration)
                     row["tags"] = ";".join(tag.lower().strip() for tag in row["tags"])
+                    if quad_detector is not None:
+                        row["quad"] = json.dumps(
+                            quad_detector(Path(filepath), client_adapter, verbose)
+                        )
                     row.update(
                         {
                             "timestamp": datetime.now().isoformat(),
@@ -1304,6 +1335,67 @@ def tag_images(
                     )
     finally:
         client_adapter.cleanup()
+
+
+def populate_metadata_quads(
+    metadata_filename: Pathish,
+    *,
+    quad_detector: Callable[[Path, VisionModelClientAdapter, int], list[list[float]]],
+    provider: VisionModelProvider = VisionModelProvider.OPENAI,
+    verbose: int = 1,
+) -> int:
+    """Populate blank quad values for tagged metadata rows with existing images."""
+    metadata_path = Path(metadata_filename)
+    if not metadata_path.is_file():
+        return 0
+    ensure_metadata_columns(metadata_path, ["quad"])
+    metadata_df = pd.read_csv(metadata_path, keep_default_na=False)
+    rows_to_process: list[tuple[Hashable, Path]] = []
+    for index, raw_row in metadata_df.iterrows():
+        row = cast("pd.Series[Any]", raw_row)
+        if str(row.get("status", "")).strip() != "ok" or str(row["quad"]).strip():
+            continue
+        original_filepath = str(row.get("original_filepath", "")).strip()
+        if not original_filepath:
+            continue
+        original_path = Path(original_filepath)
+        clean_filename = str(row.get("clean_filename", "")).strip()
+        candidate_paths = [original_path]
+        if clean_filename:
+            candidate_paths.append(original_path.with_name(clean_filename))
+        image_path = next((path for path in candidate_paths if path.is_file()), None)
+        if image_path is not None:
+            rows_to_process.append((index, image_path))
+
+    if not rows_to_process:
+        return 0
+    client_adapter = get_vision_model_client_adapter(provider)
+    if verbose >= 1:
+        print(f"Using {client_adapter}")
+    completed_count = 0
+    try:
+        for row_number, (index, image_path) in enumerate(rows_to_process):
+            try:
+                metadata_df.at[index, "quad"] = json.dumps(
+                    quad_detector(image_path, client_adapter, verbose)
+                )
+                completed_count += 1
+                if verbose == 0:
+                    print(".", end="\n" if (row_number + 1) % 100 == 0 else "")
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                if verbose == 0:
+                    print("e", end="\n" if (row_number + 1) % 100 == 0 else "")
+                elif verbose >= 2:
+                    traceback.print_exc()
+        if verbose == 0:
+            print()
+    finally:
+        client_adapter.cleanup()
+    if completed_count:
+        metadata_df.to_csv(metadata_path, index=False)
+    return completed_count
 
 
 def previously_tagged_filenames(metadata_filename: Pathish) -> set[str]:

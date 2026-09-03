@@ -277,6 +277,22 @@ def detect_crop(
     )
 
 
+def detect_quad(
+    source_path: Path,
+    client_adapter: it.VisionModelClientAdapter,
+    verbose: int = 1,
+) -> list[list[float]]:
+    """Return VLM-refined source-relative corners for an image."""
+    with Image.open(source_path) as source_file:
+        source = source_file.convert("RGB")
+    detection = detect_crop(source, client=client_adapter, verbose=verbose)
+    width, height = source.size
+    return [
+        [float(x) / max(1, width - 1), float(y) / max(1, height - 1)]
+        for x, y in detection.final_corners
+    ]
+
+
 def _detection_edges(image: np.ndarray, background: BackgroundHint | None) -> np.ndarray:
     """Find broad luminance edges, supplemented by a stable background color."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)

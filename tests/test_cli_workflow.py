@@ -1537,6 +1537,43 @@ def test_generate_gallery_creates_expected_html(tmp_path: Path) -> None:
     assert "This row should not render." not in html
 
 
+def test_review_crop_uses_stored_quad_in_perspective_mode(
+    tmp_path: Path,
+) -> None:
+    """Expose a non-full stored quad for crop-editor initialization."""
+    uploads_dir = tmp_path / "uploads"
+    uploads_dir.mkdir()
+    image_filename = uploads_dir / "sample.jpg"
+    Image.new("RGB", (10, 20), "red").save(image_filename)
+    metadata_filename = uploads_dir / "image_metadata.csv"
+    quad = [[0.1, 0.2], [0.9, 0.2], [0.8, 0.9], [0.2, 0.9]]
+    row = dict.fromkeys([*it.csv_columns, "quad"], "")
+    row.update(
+        {
+            "status": "ok",
+            "original_filepath": str(image_filename),
+            "original_filename": image_filename.name,
+            "clean_filename": image_filename.name,
+            "quad": json.dumps(quad),
+        }
+    )
+    with metadata_filename.open("w", newline="", encoding="utf-8") as metadata_file:
+        writer = csv.DictWriter(metadata_file, fieldnames=row)
+        writer.writeheader()
+        writer.writerow(row)
+
+    review_app.set_review_metadata(
+        metadata_filename,
+        write_test_stackmap(uploads_dir),
+    )
+    response = TestClient(review_app.app).get("/")
+
+    assert response.status_code == 200
+    assert f'data-image-quad="{json.dumps(quad)}"' in response.text
+    assert "const normalizedQuad = card.dataset.imageQuad;" in response.text
+    assert "selectMode(isFullQuad ? 'rectangle' : 'perspective');" in response.text
+
+
 def test_review_app_updates_one_based_metadata_row(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3019,6 +3056,106 @@ def test_tag_allows_instructions_filename_override(
 
     assert PROMPTS
     assert all(prompt.startswith("Custom tagging instructions.") for prompt in PROMPTS)
+
+
+def test_tag_quad_writes_detected_corners_and_migrates_metadata_column(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_tag: Callable[..., str],
+) -> None:
+    """Store detected normalized image corners when requested."""
+    uploads_dir = tmp_path / "uploads"
+    uploads_dir.mkdir()
+    Image.new("RGB", (10, 20), "white").save(uploads_dir / "ai.jpg")
+    metadata_filename = uploads_dir / "image_metadata.csv"
+    metadata_filename.write_text(",".join(it.csv_columns) + "\n", encoding="utf-8")
+    expected_quad = [[0.1, 0.2], [0.9, 0.2], [0.8, 0.9], [0.2, 0.9]]
+    calls: list[tuple[Path, int]] = []
+
+    def fake_detect_quad(
+        filepath: Path,
+        client_adapter: it.VisionModelClientAdapter,
+        verbose: int,
+    ) -> list[list[float]]:
+        """Return fixed detected corners while recording the request."""
+        del client_adapter
+        calls.append((filepath, verbose))
+        return expected_quad
+
+    monkeypatch.setattr(transform, "detect_quad", fake_detect_quad, raising=False)
+
+    run_tag(uploads_dir, "--quad", "-q")
+
+    with metadata_filename.open(newline="", encoding="utf-8") as metadata_file:
+        reader = csv.DictReader(metadata_file)
+        rows = list(reader)
+
+    assert reader.fieldnames is not None
+    assert "quad" in reader.fieldnames
+    assert json.loads(rows[0]["quad"]) == expected_quad
+    assert calls == [(uploads_dir / "ai.jpg", 0)]
+
+
+def test_quad_cli_populates_only_existing_tagged_images_without_quads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_cli: Callable[..., str],
+) -> None:
+    """Populate blank quad values without retagging or revisiting saved values."""
+    uploads_dir = tmp_path / "uploads"
+    uploads_dir.mkdir()
+    image_filename = uploads_dir / "needs_quad.jpg"
+    Image.new("RGB", (10, 20), "white").save(image_filename)
+    metadata_filename = uploads_dir / "image_metadata.csv"
+    with metadata_filename.open("w", newline="", encoding="utf-8") as metadata_file:
+        writer = csv.DictWriter(metadata_file, fieldnames=it.csv_columns)
+        writer.writeheader()
+        writer.writerows(
+            [
+                {
+                    "status": "ok",
+                    "original_filepath": str(image_filename),
+                    "original_filename": image_filename.name,
+                },
+                {
+                    "status": "ok",
+                    "original_filepath": str(uploads_dir / "missing.jpg"),
+                    "original_filename": "missing.jpg",
+                },
+            ]
+        )
+    expected_quad = [[0.1, 0.2], [0.9, 0.2], [0.8, 0.9], [0.2, 0.9]]
+    calls: list[Path] = []
+
+    def fake_detect_quad(
+        filepath: Path,
+        client_adapter: it.VisionModelClientAdapter,
+        verbose: int,
+    ) -> list[list[float]]:
+        """Return fixed corners while recording the image selected for processing."""
+        del client_adapter, verbose
+        calls.append(filepath)
+        return expected_quad
+
+    monkeypatch.setattr(transform, "detect_quad", fake_detect_quad, raising=False)
+    monkeypatch.setattr(
+        it,
+        "get_vision_model_client_adapter",
+        lambda provider: MockVisionModelClientAdapter(),
+    )
+
+    run_cli("quad", str(uploads_dir), "-q")
+    run_cli("quad", str(uploads_dir), "-q")
+
+    with metadata_filename.open(newline="", encoding="utf-8") as metadata_file:
+        reader = csv.DictReader(metadata_file)
+        rows = list(reader)
+
+    assert reader.fieldnames is not None
+    assert "quad" in reader.fieldnames
+    assert json.loads(rows[0]["quad"]) == expected_quad
+    assert rows[1]["quad"] == ""
+    assert calls == [image_filename]
 
 
 def test_dedupe_image_matches_accepts_self_comparison_upper_triangle(

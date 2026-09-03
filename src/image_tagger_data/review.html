@@ -697,7 +697,28 @@
                         [image.naturalWidth - 1, image.naturalHeight - 1],
                         [0, image.naturalHeight - 1],
                     ];
-                    selectMode('rectangle');
+                    const fullQuad = state.points.map((point) => [...point]);
+                    const normalizedQuad = card.dataset.imageQuad;
+                    let isFullQuad = true;
+                    if (normalizedQuad) {
+                        try {
+                            const quad = JSON.parse(normalizedQuad);
+                            if (!Array.isArray(quad) || quad.length !== 4 || quad.some((point) => !Array.isArray(point) || point.length !== 2 || point.some((coordinate) => !Number.isFinite(coordinate)))) {
+                                throw new Error('Invalid quad.');
+                            }
+                            state.points = quad.map(([x, y]) => [
+                                x * (image.naturalWidth - 1),
+                                y * (image.naturalHeight - 1),
+                            ]);
+                            isFullQuad = state.points.every((point, index) => (
+                                Math.abs(point[0] - fullQuad[index][0]) < 1e-6
+                                && Math.abs(point[1] - fullQuad[index][1]) < 1e-6
+                            ));
+                        } catch {
+                            state.points = fullQuad;
+                        }
+                    }
+                    selectMode(isFullQuad ? 'rectangle' : 'perspective');
                 } catch (error) {
                     errorBox().textContent = error.message;
                 } finally {

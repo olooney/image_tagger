@@ -1,4 +1,4 @@
-<form id="row-{{ item.row_id }}" class="gallery-image row mb-4" data-image-filename="{{ item.current_filename }}" data-image-width="{{ item.display_width }}" data-image-height="{{ item.display_height }}" hx-post="/row/{{ item.row_id }}" hx-target="#row-{{ item.row_id }}" hx-swap="outerHTML">
+<form id="row-{{ item.row_id }}" class="gallery-image row mb-4" data-image-filename="{{ item.current_filename }}" data-image-width="{{ item.display_width }}" data-image-height="{{ item.display_height }}"{% if item.quad %} data-image-quad="{{ item.quad }}"{% endif %} hx-post="/row/{{ item.row_id }}" hx-target="#row-{{ item.row_id }}" hx-swap="outerHTML">
     <div class="col-md-6">
         <img src="{{ item.image_src }}" alt="{{ item.original_filename }}" class="img-fluid crop-trigger" data-crop-row="{{ item.row_id }}">
     </div>

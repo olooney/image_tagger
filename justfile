@@ -11,6 +11,9 @@ convert *args:
 tag *args:
     {{python}} src/cli.py tag {{args}}
 
+quad *args:
+    {{python}} src/cli.py quad {{args}}
+
 dedupe *args:
     {{python}} src/cli.py dedupe {{args}}
 
@@ -41,7 +44,12 @@ wall *args:
 report *args:
     {{python}} src/cli.py report {{args}}
 
-run: convert tag rename review
+run *args:
+    {{python}} src/cli.py convert {{args}}
+    {{python}} src/cli.py tag {{args}}
+    {{python}} src/cli.py rename {{args}}
+    {{python}} src/cli.py quad {{args}}
+    {{python}} src/cli.py review {{args}}
 
 # test tasks
 

@@ -357,6 +357,7 @@ def review_items(metadata_path: Path) -> list[dict[str, Any]]:
         )
         item["current_filename"] = image_path.name
         item["clean_filename"] = str(item.get("clean_filename", ""))
+        item["quad"] = str(item.get("quad", "")).strip()
         with Image.open(image_path) as source_image:
             item["display_width"], item["display_height"] = source_image.size
         item["tags_text"] = "\n".join(

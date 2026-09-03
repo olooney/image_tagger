@@ -44,14 +44,19 @@ tag, and do human-in-the-loop review of new images, do:
 just convert [DIRECTORY]  # normalize image extensions and metadata
 just tag [DIRECTORY]      # Have a VLM infer tags, categories, clean filenames, etc.
 just rename [DIRECTORY]   # renamed image files to VLM-inferred filenames
+just quad [DIRECTORY]     # fill in missing perspective-corner metadata for tagged images
 just review [DIRECTORY]   # open interactive HTMX review app
 ```
 
-Or just run this command to do all four in sequence:
+Or just run this command to do all five in sequence:
 
 ```bash
-just run [DIRECTORY]
+just run [DIRECTORY] [OPTIONS]
 ```
+
+`just run` passes its directory and options shared by the workflow commands to
+`convert`, `tag`, `rename`, and `review`; for example, use `just run uploads -vv`
+for detailed output throughout the workflow.
 
 Next, you can run these individually as needed:
 
@@ -114,6 +119,10 @@ paths. For example, `just dedupe books` uses the configured `books` shelf, and
 in a structured dataset. It also determines a clean filename for each image
 according to internal naming conventions. Multiple model providers are supported
 ([Download example CSV](https://olooney.github.io/image-tagger/docs/example/image_metadata.csv)).
+
+`just quad` calculates missing `quad` values for existing images with successful
+tag metadata. It skips rows whose files are missing or whose `quad` value is
+already populated.
 
 `just clip` automatically applies a perspective transform to orthorectify (unskew) images.
 It determines the correct transform using a combination of traditional computer vision
