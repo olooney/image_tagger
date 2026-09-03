@@ -35,6 +35,7 @@ const cropEditor = (() => {
         rectangleNaturalHeight: 1,
         dragStartAspect: null,
         canvasBackgroundIndex: 2,
+        eyedropperActive: false,
     };
 
     const canvasBackgrounds = [
@@ -53,6 +54,7 @@ const cropEditor = (() => {
     const outputHeightInput = () => document.querySelector('#crop-output-height');
     const downsamplingSelect = () => document.querySelector('#crop-downsampling');
     const resultSize = () => document.querySelector('#crop-result-size');
+    const eyedropperButton = () => document.querySelector('#crop-eyedropper');
 
     const downsamplingRatios = [
         ['80%', 0.8],
@@ -102,6 +104,14 @@ const cropEditor = (() => {
         Number.parseInt(hex.slice(3, 5), 16),
         Number.parseInt(hex.slice(5, 7), 16),
     ];
+
+    const setEyedropperActive = (active) => {
+        state.eyedropperActive = active;
+        sourceCanvas().classList.toggle('eyedrop-active', active);
+        eyedropperButton().classList.toggle('btn-light', active);
+        eyedropperButton().classList.toggle('btn-outline-light', !active);
+        eyedropperButton().setAttribute('aria-pressed', active ? 'true' : 'false');
+    };
 
     const solveLinearSystem = (matrix, values) => {
         const rows = matrix.map((row, index) => [...row, values[index]]);
@@ -229,6 +239,26 @@ const cropEditor = (() => {
         (y - state.view.top) / state.view.scale,
     ];
 
+    const sampleEyedropperColor = (pointer) => {
+        if (!state.imageData || !state.view
+            || pointer[0] < state.view.left || pointer[0] >= state.view.left + state.view.width
+            || pointer[1] < state.view.top || pointer[1] >= state.view.top + state.view.height) {
+            return false;
+        }
+        // Sample the original raster rather than the scaled source canvas.
+        const [imageX, imageY] = canvasToImage(pointer);
+        const x = Math.max(0, Math.min(state.imageData.width - 1, Math.floor(imageX)));
+        const y = Math.max(0, Math.min(state.imageData.height - 1, Math.floor(imageY)));
+        const pixelIndex = (y * state.imageData.width + x) * 4;
+        const color = [0, 1, 2]
+            .map((offset) => state.imageData.data[pixelIndex + offset].toString(16).padStart(2, '0'))
+            .join('');
+        colorInput().value = `#${color}`;
+        colorInput().dispatchEvent(new Event('input', { bubbles: true }));
+        setEyedropperActive(false);
+        return true;
+    };
+
     const renderSource = () => {
         if (!state.image) return;
         const canvas = sourceCanvas();
@@ -297,6 +327,12 @@ const cropEditor = (() => {
     const pointerDown = (event) => {
         if (!state.view) return;
         const pointer = pointerPosition(event);
+        if (state.eyedropperActive) {
+            if (!sampleEyedropperColor(pointer)) {
+                setEyedropperActive(false);
+            }
+            return;
+        }
         const points = state.points.map(imageToCanvas);
         let closest = null;
         let closestDistance = 18;
@@ -482,6 +518,7 @@ const cropEditor = (() => {
 
     const close = () => {
         window.clearTimeout(state.previewTimer);
+        setEyedropperActive(false);
         modal().hidden = true;
         document.body.classList.remove('crop-open');
         state.rowId = null;
@@ -514,6 +551,7 @@ const cropEditor = (() => {
 
     const open = async (rowId) => {
         state.rowId = rowId;
+        setEyedropperActive(false);
         state.canvasBackgroundIndex = 2;
         setCanvasBackground();
         errorBox().textContent = '';
@@ -596,6 +634,7 @@ const cropEditor = (() => {
             cardImage.src = `${result.image_src}?v=${Date.now()}`;
             card.dataset.imageWidth = result.width;
             card.dataset.imageHeight = result.height;
+            card.dataset.imageQuad = JSON.stringify([[0, 0], [1, 0], [1, 1], [0, 1]]);
             card.querySelector('.image-dimensions').innerHTML = `<span${result.width > 2000 ? ' class="filename-mismatch"' : ''}>${result.width}</span>x<span${result.height > 2000 ? ' class="filename-mismatch"' : ''}>${result.height}</span>`;
             close();
         } catch (error) {
@@ -662,6 +701,9 @@ const cropEditor = (() => {
         sourceCanvas().addEventListener('pointerup', pointerUp);
         sourceCanvas().addEventListener('pointercancel', pointerUp);
         colorInput().addEventListener('input', bufferPreview);
+        eyedropperButton().addEventListener('click', () => {
+            setEyedropperActive(!state.eyedropperActive);
+        });
         document.querySelector('#crop-canvas-background').addEventListener('click', cycleCanvasBackground);
         downsamplingSelect().addEventListener('change', () => {
             if (!downsamplingSelect().value) return;
@@ -694,7 +736,19 @@ const cropEditor = (() => {
             button.addEventListener('click', () => detect(button.dataset.cropDetector, button));
         });
         window.addEventListener('resize', renderSource);
+        document.addEventListener('pointerdown', (event) => {
+            // Outside interactions retain their normal behavior while dismissing the eyedropper.
+            if (state.eyedropperActive
+                && !sourceCanvas().contains(event.target)
+                && !eyedropperButton().contains(event.target)) {
+                setEyedropperActive(false);
+            }
+        });
         document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && state.eyedropperActive) {
+                setEyedropperActive(false);
+                return;
+            }
             if (event.key === 'Escape' && !modal().hidden) {
                 close();
                 return;

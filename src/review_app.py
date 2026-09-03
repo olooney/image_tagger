@@ -1,4 +1,5 @@
 import html
+import json
 import logging
 import os
 import re
@@ -38,6 +39,7 @@ card_template = template_environment.get_template("review_card.html")
 app = FastAPI(title="Image Metadata Review")
 LOGGER: logging.Logger = logging.getLogger(__name__)
 REVIEW_ID_COLUMN: str = it.REVIEW_ID_COLUMN
+FULL_QUAD: str = json.dumps([[0, 0], [1, 0], [1, 1], [0, 1]])
 GENRE_OPTIONS: list[str] = [
     "sci-fi",
     "fantasy",
@@ -406,7 +408,9 @@ def write_metadata_row(metadata_path: Path, row_id: str, updates: dict[str, str]
     if not metadata_path.is_file():
         raise ValueError(f"Metadata file not found: {metadata_path}")
 
-    editable_columns = {"category", "genre", "clean_filename", "tags", "description"}
+    if "quad" in updates:
+        it.ensure_metadata_columns(metadata_path, ["quad"])
+    editable_columns = {"category", "genre", "clean_filename", "tags", "description", "quad"}
     metadata_df = pd.read_csv(metadata_path, keep_default_na=False)
     row_index = metadata_row_index(metadata_df, row_id)
 
@@ -624,9 +628,11 @@ async def clip_details(
 async def clip_row(row_id: str, request: ClipRequest) -> dict[str, str | int]:
     """Apply an interactive perspective correction to one image."""
     try:
-        image_path = review_row_image_path(review_metadata_path(), row_id)
+        metadata_path = review_metadata_path()
+        image_path = review_row_image_path(metadata_path, row_id)
         apply_clip(image_path, request)
-        relative_path = os.path.relpath(image_path, review_metadata_path().parent)
+        write_metadata_row(metadata_path, row_id, {"quad": FULL_QUAD})
+        relative_path = os.path.relpath(image_path, metadata_path.parent)
         with Image.open(image_path) as clipped_image:
             width, height = clipped_image.size
         return {

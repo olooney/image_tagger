@@ -1589,6 +1589,33 @@ def test_review_template_inlines_separate_javascript_file() -> None:
     assert 'src="review.js"' not in rendered_template
 
 
+def test_review_crop_has_one_shot_background_eyedropper() -> None:
+    """Provide an eyedropper that samples source-image pixels once."""
+    review_template = (
+        REPO_ROOT / "src" / "image_tagger_data" / "review.html"
+    ).read_text(encoding="utf-8")
+    review_script = (
+        REPO_ROOT / "src" / "image_tagger_data" / "review.js"
+    ).read_text(encoding="utf-8")
+
+    assert 'id="crop-eyedropper"' in review_template
+    assert ".eyedrop-active" in review_template
+    assert "eyedropperActive: false" in review_script
+    assert "const sampleEyedropperColor" in review_script
+    assert "sourceCanvas().classList.toggle('eyedrop-active', active);" in review_script
+    assert "if (state.eyedropperActive)" in review_script
+    assert "document.addEventListener('pointerdown'" in review_script
+
+
+def test_review_crop_updates_card_quad_after_apply() -> None:
+    """Keep the open review card in sync with persisted crop metadata."""
+    review_script = (
+        REPO_ROOT / "src" / "image_tagger_data" / "review.js"
+    ).read_text(encoding="utf-8")
+
+    assert "card.dataset.imageQuad = JSON.stringify([[0, 0], [1, 0], [1, 1], [0, 1]]);" in review_script
+
+
 def test_review_app_updates_one_based_metadata_row(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1777,6 +1804,13 @@ def test_review_app_updates_one_based_metadata_row(
     }
     assert trashed_paths == [image_filename]
     assert image_filename.is_file()
+
+    with metadata_filename.open(newline="", encoding="utf-8") as metadata_file:
+        reader = csv.DictReader(metadata_file)
+        cropped_row = next(reader)
+    assert reader.fieldnames is not None
+    assert "quad" in reader.fieldnames
+    assert json.loads(cropped_row["quad"]) == [[0, 0], [1, 0], [1, 1], [0, 1]]
 
     response = client.delete("/row/1")
     assert response.status_code == 200
