@@ -1574,6 +1574,21 @@ def test_review_crop_uses_stored_quad_in_perspective_mode(
     assert "selectMode(isFullQuad ? 'rectangle' : 'perspective');" in response.text
 
 
+def test_review_template_inlines_separate_javascript_file() -> None:
+    """Keep review JavaScript editable while rendering a self-contained page."""
+    review_template = (
+        REPO_ROOT / "src" / "image_tagger_data" / "review.html"
+    ).read_text(encoding="utf-8")
+    review_script = REPO_ROOT / "src" / "image_tagger_data" / "review.js"
+
+    assert '{% include "review.js" %}' in review_template
+    assert review_script.is_file()
+    assert "const cropEditor" in review_script.read_text(encoding="utf-8")
+    rendered_template = review_app.page_template.render()
+    assert "const cropEditor" in rendered_template
+    assert 'src="review.js"' not in rendered_template
+
+
 def test_review_app_updates_one_based_metadata_row(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
